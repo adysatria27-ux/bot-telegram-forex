@@ -4,9 +4,8 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler
 
-# API Key Twelve Data
-API_KEY = os.getenv(1551539deae5472f80e506c8a76b0aed)
-# Token Telegram
+# Konfigurasi langsung
+API_KEY = "1551539deae5472f80e506c8a76b0aed"
 TOKEN = "8866350485:AAE9aI9eUqFm1YynbVy2UfTLHYt_gPCDZFM"
 
 def get_live_price(symbol):
