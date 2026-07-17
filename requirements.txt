@@ -3,3 +3,4 @@ requests
 aiohttp
 pandas
 numpy
+httpx
