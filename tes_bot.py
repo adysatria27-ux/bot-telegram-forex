@@ -53,7 +53,7 @@ from telegram.ext import ContextTypes
 logger = logging.getLogger(__name__)
 
 # ── Konfigurasi ──────────────────────────────────────────────────────────────
-TWELVE_DATA_API_KEY = os.getenv("1551539deae5472f80e506c8a76b0aed", "")
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "")
 BASE_URL = "https://api.twelvedata.com/time_series"
 
 DEFAULT_SYMBOL = "XAU/USD"
