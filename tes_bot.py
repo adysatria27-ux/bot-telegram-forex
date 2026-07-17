@@ -5,7 +5,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler
 
 # API Key Twelve Data
-API_KEY = os.getenv('TWELVE_API_KEY')
+API_KEY = os.getenv(1551539deae5472f80e506c8a76b0aed)
 # Token Telegram
 TOKEN = "8866350485:AAE9aI9eUqFm1YynbVy2UfTLHYt_gPCDZFM"
 
