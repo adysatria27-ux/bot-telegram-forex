@@ -4,8 +4,10 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler
 
-# Mengambil API Key dari Variable Railway
+# API Key Twelve Data
 API_KEY = os.getenv('TWELVE_API_KEY')
+# Token Telegram
+TOKEN = "8866350485:AAE9aI9eUqFm1YynbVy2UfTLHYt_gPCDZFM"
 
 def get_live_price(symbol):
     url = f"https://api.twelvedata.com/price?symbol={symbol}&apikey={API_KEY}"
@@ -37,7 +39,6 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text=f"Harga EURUSD saat ini: {harga}")
 
 if __name__ == '__main__':
-    TOKEN = os.getenv('BOT_TOKEN')
     application = ApplicationBuilder().token(TOKEN).build()
     
     application.add_handler(CommandHandler('start', start))
