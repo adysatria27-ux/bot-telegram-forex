@@ -3,55 +3,71 @@ import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler
 
-# Konfigurasi API (Menggunakan API Key dan Token Anda)
+# Konfigurasi Akses
 API_KEY = "1551539deae5472f80e506c8a76b0aed"
 TOKEN = "8866350485:AAE9aI9eUqFm1YynbVy2UfTLHYt_gPCDZFM"
 
-def get_market_data(symbol):
-    """Mengambil data harga dan RSI pada timeframe 5 menit untuk scalping."""
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize=1&apikey={API_KEY}"
-    rsi_url = f"https://api.twelvedata.com/rsi?symbol={symbol}&interval=5min&time_period=14&apikey={API_KEY}"
+def get_market_data(symbol, interval):
+    """Mengambil data teknikal: Harga, RSI 14, dan SMA 20."""
+    base_url = "https://api.twelvedata.com"
     try:
-        price_res = requests.get(url).json()
-        rsi_res = requests.get(rsi_url).json()
+        # Panggilan API
+        p_res = requests.get(f"{base_url}/price?symbol={symbol}&apikey={API_KEY}").json()
+        r_res = requests.get(f"{base_url}/rsi?symbol={symbol}&interval={interval}&time_period=14&apikey={API_KEY}").json()
+        s_res = requests.get(f"{base_url}/sma?symbol={symbol}&interval={interval}&time_period=20&apikey={API_KEY}").json()
         
-        price = float(price_res['values'][0]['close'])
-        rsi = float(rsi_res['values'][0]['rsi'])
-        return price, rsi
+        return float(p_res['price']), float(r_res['values'][0]['rsi']), float(s_res['values'][0]['sma'])
     except Exception:
-        return None, None
+        return None, None, None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton("⚡ Scalping XAU/USD (5m)", callback_data='signal_xau')]]
-    await update.message.reply_text("🤖 Scalper Bot Aktif. Tekan tombol untuk sinyal:", reply_markup=InlineKeyboardMarkup(keyboard))
+    """Menu utama untuk memilih timeframe."""
+    keyboard = [
+        [InlineKeyboardButton("⚡ 5m (Scalp)", callback_data='5min'), InlineKeyboardButton("⚡ 15m (Scalp)", callback_data='15min')],
+        [InlineKeyboardButton("📊 30m (Trend)", callback_data='30min'), InlineKeyboardButton("📊 1h (Trend)", callback_data='1h')]
+    ]
+    await update.message.reply_text("Pilih Timeframe untuk Analisis XAU/USD:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Proses analisis berdasarkan pilihan timeframe."""
     query = update.callback_query
+    interval = query.data
     await query.answer()
     
-    if query.data == 'signal_xau':
-        price, rsi = get_market_data("XAU/USD")
-        if price:
-            # Logika Sinyal Scalping agresif
-            trend = "NEUTRAL"
-            if rsi < 35: trend = "🟢 BUY (Oversold)"
-            elif rsi > 65: trend = "🔴 SELL (Overbought)"
-            
-            # SL/TP ketat untuk Scalping
-            sl = price - 2.0 if "BUY" in trend else price + 2.0
-            tp = price + 3.0 if "BUY" in trend else price - 3.0
-            
-            msg = (f"⚡ **SCALPING ANALYTICS**\n"
-                   f"Symbol: XAU/USD\n"
-                   f"Price: ${price:.2f} | RSI: {rsi:.2f}\n"
-                   f"Signal: {trend}\n\n"
-                   f"🎯 TP: ${tp:.2f}\n🛡 SL: ${sl:.2f}\n\n"
-                   f"💡 *Entry cepat, amankan profit!*")
-            await query.edit_message_text(text=msg, parse_mode='Markdown')
-        else:
-            await query.edit_message_text(text="❌ Gagal ambil data. Coba lagi nanti.")
+    price, rsi, sma = get_market_data("XAU/USD", interval)
+    
+    if price:
+        confidence = 50
+        trend = "NEUTRAL"
+        
+        # Logika Konfluensi (Harga & Tren SMA)
+        if price > sma and rsi < 40: 
+            trend = "🟢 BUY"
+            confidence += 30
+        elif price < sma and rsi > 60:
+            trend = "🔴 SELL"
+            confidence += 30
+        
+        # Bonus tambahan untuk RSI Ekstrim (Overbought/Oversold)
+        if rsi < 30 or rsi > 70: confidence += 15
+
+        # Perhitungan Dinamis SL/TP
+        tp = (price + 3.0) if "BUY" in trend else (price - 3.0)
+        sl = (price - 2.0) if "BUY" in trend else (price + 2.0)
+
+        msg = (f"📈 **Analisis XAU/USD - {interval}**\n\n"
+               f"💰 Price: ${price:.2f}\n"
+               f"📉 RSI: {rsi:.1f} | SMA20: ${sma:.2f}\n"
+               f"🎯 Signal: {trend} (Conf: {min(confidence, 95)}%)\n\n"
+               f"🎯 Target Profit: ${tp:.2f}\n🛡 Stop Loss: ${sl:.2f}\n\n"
+               f"⚠️ *Trading dengan disiplin & RRR yang ketat!*")
+        
+        await query.edit_message_text(text=msg, parse_mode='Markdown')
+    else:
+        await query.edit_message_text(text="❌ Data gagal dimuat. Coba lagi dalam beberapa detik.")
 
 if __name__ == '__main__':
+    # Membangun aplikasi bot
     application = ApplicationBuilder().token(TOKEN).build()
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CallbackQueryHandler(button))
