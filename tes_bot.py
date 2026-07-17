@@ -7,48 +7,57 @@ import numpy as np
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
-# --- SETUP & KONFIGURASI ---
+# --- 1. SETUP ---
 logging.basicConfig(level=logging.INFO)
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
-# [DI SINI: Masukkan seluruh logika get_market_data dan generate_signal_message 
-# yang panjang dari kode sebelumnya]
-# Pastikan semua fungsi tersebut ada di atas fungsi button() agar terbaca.
+# --- 2. LOGIKA ANALISIS (FUNGSI UTAMA) ---
+async def get_market_data(symbol="XAU/USD"):
+    async with aiohttp.ClientSession() as session:
+        url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=15min&outputsize=50&apikey={API_KEY}"
+        async with session.get(url) as resp:
+            data = await resp.json()
+            if "values" not in data: raise Exception("Data tidak ditemukan")
+            df = pd.DataFrame(data["values"])
+            df[["close", "high", "low"]] = df[["close", "high", "low"]].astype(float)
+            price = df["close"].iloc[-1]
+            sma = df["close"].rolling(20).mean().iloc[-1]
+            atr = (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
+            signal = "BUY" if price > sma else "SELL"
+            return {"symbol": symbol, "price": price, "signal": signal, "sma": sma, "atr": atr}
 
-# --- HANDLER TOMBOL ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [["Cek Harga XAUUSD"], ["Cek Harga EURUSD"]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await update.message.reply_text("Silakan pilih menu:", reply_markup=reply_markup)
+def generate_signal_message(data):
+    return (f"📊 *Analisis {data['symbol']}*\n\n"
+            f"Harga: ${data['price']:.2f}\n"
+            f"Sinyal: *{data['signal']}*\n"
+            f"SMA20: ${data['sma']:.2f}\n"
+            f"ATR: {data['atr']:.2f}")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- 3. HANDLER MENU & TOMBOL ---
+async def start(update, context):
+    kb = [["Cek Harga XAUUSD"], ["Cek Harga EURUSD"]]
+    await update.message.reply_text("Silakan pilih menu:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+
+async def handle_message(update, context):
     text = update.message.text
-    if text == "Cek Harga XAUUSD":
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📊 Analisa Pro XAU/USD", callback_data="analyze_xauusd")]])
-        await update.message.reply_text("Klik tombol di bawah untuk melihat analisis lengkap:", reply_markup=kb)
-    elif text == "Cek Harga EURUSD":
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📊 Analisa Pro EUR/USD", callback_data="analyze_eurusd")]])
-        await update.message.reply_text("Klik tombol di bawah untuk melihat analisis lengkap:", reply_markup=kb)
+    if text in ["Cek Harga XAUUSD", "Cek Harga EURUSD"]:
+        sym = "XAU/USD" if "XAU" in text else "EUR/USD"
+        cb = "analyze_xauusd" if "XAU" in text else "analyze_eurusd"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"📊 Analisa {sym}", callback_data=cb)]])
+        await update.message.reply_text(f"Klik tombol untuk analisa {sym}:", reply_markup=kb)
 
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button(update, context):
     query = update.callback_query
     await query.answer()
-    
-    # Menentukan simbol berdasarkan tombol yang diklik
-    symbol = "XAU/USD" if query.data == "analyze_xauusd" else "EUR/USD"
-    
-    await query.edit_message_text(f"⏳ Mengambil data {symbol}...")
-    
+    sym = "XAU/USD" if query.data == "analyze_xauusd" else "EUR/USD"
+    await query.edit_message_text(f"⏳ Menganalisis {sym}...")
     try:
-        # Menjalankan analisis dan menampilkan hasil lengkap
-        analysis = await get_market_data(symbol)
-        msg = generate_signal_message(analysis)
-        await query.edit_message_text(msg, parse_mode="Markdown")
-    except Exception as e:
-        await query.edit_message_text(f"❌ Gagal mengambil data {symbol}. Coba lagi nanti.")
+        data = await get_market_data(sym)
+        await query.edit_message_text(generate_signal_message(data), parse_mode="Markdown")
+    except:
+        await query.edit_message_text(f"❌ Gagal mengambil data {sym}.")
 
-# --- MAIN RUNNER ---
 if __name__ == '__main__':
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
