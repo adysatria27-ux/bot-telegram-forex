@@ -8,7 +8,6 @@ from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, Callb
 API_KEY = os.getenv('TWELVE_API_KEY')
 
 def get_live_price(symbol):
-    # Mengambil data dari Twelve Data
     url = f"https://api.twelvedata.com/price?symbol={symbol}&apikey={API_KEY}"
     try:
         response = requests.get(url).json()
@@ -36,7 +35,6 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text=f"Harga EURUSD saat ini: ${harga}")
 
 if __name__ == '__main__':
-    # Pastikan BOT_TOKEN juga disimpan di Variables Railway dengan nama BOT_TOKEN
     TOKEN = os.getenv('BOT_TOKEN')
     application = ApplicationBuilder().token(TOKEN).build()
     
