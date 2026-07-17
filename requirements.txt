@@ -1,6 +1,5 @@
 python-telegram-bot
 requests
 aiohttp
-pandas
-httpx>=0.27
-numpy>=1.26
+numpy
+httpx
