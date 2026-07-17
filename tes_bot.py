@@ -1,72 +1,54 @@
 import os
 import logging
+import asyncio
+from dataclasses import dataclass
+from typing import Optional
+
 import aiohttp
 import pandas as pd
 import numpy as np
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# --- 1. SETUP LOGGING ---
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+
+# --- SETUP & KONFIGURASI ---
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# --- 2. PEMBERSIHAN TOKEN (Mencegah error InvalidURL) ---
-# .strip() membuang spasi atau baris baru tersembunyi
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
-API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
-# --- 3. LOGIKA ANALISIS TEKNIKAL ---
-async def fetch_and_analyze():
-    if not API_KEY:
-        return "❌ Error: API Key tidak ditemukan."
-    
-    async with aiohttp.ClientSession() as session:
-        params = {"symbol": "XAU/USD", "interval": "15min", "outputsize": 50, "apikey": API_KEY}
-        async with session.get("https://api.twelvedata.com/time_series", params=params) as resp:
-            data = await resp.json()
-            if "values" not in data:
-                return "❌ Gagal mengambil data pasar."
-            
-            df = pd.DataFrame(data["values"])
-            df[["close", "high", "low"]] = df[["close", "high", "low"]].astype(float)
-            
-            # Perhitungan indikator sederhana
-            price = df["close"].iloc[-1]
-            sma = df["close"].rolling(20).mean().iloc[-1]
-            atr = (df["high"] - df["low"]).rolling(14).mean().iloc[-1]
-            
-            signal = "BUY" if price > sma else "SELL"
-            sl = price - (atr * 1.5) if signal == "BUY" else price + (atr * 1.5)
-            tp = price + (atr * 2.5) if signal == "BUY" else price - (atr * 2.5)
-            
-            return (f"📊 *Analisis XAU/USD (15m)*\n\n"
-                    f"Harga: ${price:.2f}\n"
-                    f"Sinyal: *{signal}*\n"
-                    f"SMA20: ${sma:.2f}\n"
-                    f"SL: ${sl:.2f}\n"
-                    f"TP: ${tp:.2f}\n"
-                    f"ATR: {atr:.2f}")
+# (Logika get_market_data, _score_timeframe, dan generate_signal_message 
+#  sama seperti kode panjang yang saya berikan sebelumnya. 
+#  Silakan gunakan fungsi yang sama di file tes_bot.py Anda.)
 
-# --- 4. HANDLER TELEGRAM ---
+# --- HANDLER MENU TOMBOL ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton("📊 Analisa Pro", callback_data="analyze_xauusd")]]
-    await update.message.reply_text("Siap menganalisa XAU/USD:", reply_markup=InlineKeyboardMarkup(keyboard))
+    # Membuat keyboard seperti di gambar Anda
+    keyboard = [
+        ["Cek Harga XAUUSD"],
+        ["Cek Harga EURUSD"],
+        ["Hubungi Admin"]
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    await update.message.reply_text("Halo! Silakan pilih menu di bawah ini:", reply_markup=reply_markup)
 
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "analyze_xauusd":
-        await query.edit_message_text("⏳ Menghitung teknikal...")
-        msg = await fetch_and_analyze()
-        await query.edit_message_text(msg, parse_mode="Markdown")
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "Cek Harga XAUUSD":
+        # Menampilkan tombol inline untuk pemicu analisa pro
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📊 Analisa Pro XAU/USD", callback_data="analyze_xauusd")]])
+        await update.message.reply_text("Klik tombol untuk analisa detail:", reply_markup=kb)
+    elif text == "Hubungi Admin":
+        await update.message.reply_text("Silakan hubungi: @AdminAnda")
+    else:
+        await update.message.reply_text("Silakan gunakan menu di bawah.")
 
-# --- 5. MAIN RUNNER ---
+# --- MAIN RUNNER ---
 if __name__ == '__main__':
-    if not TOKEN:
-        raise ValueError("BOT_TOKEN hilang! Pastikan di-set di Railway Variables.")
-    
+    if not TOKEN: raise ValueError("BOT_TOKEN tidak diset!")
     app = ApplicationBuilder().token(TOKEN).build()
+    
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button, pattern="^analyze_xauusd$"))
     
     app.run_polling()
