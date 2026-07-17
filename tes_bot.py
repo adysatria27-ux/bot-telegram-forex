@@ -436,18 +436,3 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Tim developer sudah bisa cek log untuk detailnya.",
             reply_markup=refresh_keyboard,
         )
-# Tambahkan ini di paling bawah tes_bot.py untuk menghidupkan bot
-if __name__ == '__main__':
-    from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler
-    
-    # Fungsi start sederhana
-    async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        keyboard = [[InlineKeyboardButton("📊 Analisa XAU/USD", callback_data="analyze_xauusd")]]
-        await update.message.reply_text("Pilih menu:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button, pattern="^analyze_xauusd$"))
-    
-    print("Bot berjalan...")
-    app.run_polling()
