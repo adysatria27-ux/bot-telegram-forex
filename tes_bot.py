@@ -1,25 +1,45 @@
+import os
+import requests
+import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler
 
+# Mengambil API Key dari Variable Railway
+API_KEY = os.getenv('TWELVE_API_KEY')
+
+def get_live_price(symbol):
+    # Mengambil data dari Twelve Data
+    url = f"https://api.twelvedata.com/price?symbol={symbol}&apikey={API_KEY}"
+    try:
+        response = requests.get(url).json()
+        return response.get('price', 'N/A')
+    except:
+        return "Error"
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("Cek Harga XAUUSD", callback_data='xauusd')],
-        [InlineKeyboardButton("Cek Harga EURUSD", callback_data='eurusd')],
-        [InlineKeyboardButton("Hubungi Admin", url='https://t.me/username_anda')]
+        [InlineKeyboardButton("📊 Cek Harga XAUUSD", callback_data='xauusd')],
+        [InlineKeyboardButton("📊 Cek Harga EURUSD", callback_data='eurusd')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text('Halo! Silakan pilih menu di bawah ini:', reply_markup=reply_markup)
+    await update.message.reply_text("🚀 Bot SignalForex Aktif!", reply_markup=reply_markup)
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
     if query.data == 'xauusd':
-        await query.edit_message_text(text="Harga XAUUSD saat ini: $2415.50")
+        harga = get_live_price("XAU/USD")
+        await query.edit_message_text(text=f"Harga XAUUSD saat ini: ${harga}")
     elif query.data == 'eurusd':
-        await query.edit_message_text(text="Harga EURUSD saat ini: 1.0920")
+        harga = get_live_price("EUR/USD")
+        await query.edit_message_text(text=f"Harga EURUSD saat ini: ${harga}")
 
 if __name__ == '__main__':
-    application = ApplicationBuilder().token('8866350485:AAE9aI9eUqFm1YynbVy2UfTLHYt_gPCDZFM').build()
+    # Pastikan BOT_TOKEN juga disimpan di Variables Railway dengan nama BOT_TOKEN
+    TOKEN = os.getenv('BOT_TOKEN')
+    application = ApplicationBuilder().token(TOKEN).build()
+    
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CallbackQueryHandler(button))
     application.run_polling()
