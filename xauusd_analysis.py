@@ -28,10 +28,13 @@ Kompatibilitas:
     - Fungsi generate_signal_message() tetap tersedia.
     - Fungsi button() tetap tersedia.
     - Field lama direction, sl, tp, dan atr_value tetap dipertahankan.
+    - Cache hasil analisis dan OHLC menghemat request Twelve Data.
 ================================================================================
 """
 
 import os
+import copy
+import time
 import logging
 import asyncio
 from dataclasses import dataclass
@@ -84,6 +87,16 @@ RETRY_BACKOFF_SECONDS = 1.5
 # Harga candle terakhir tetap digunakan sebagai harga referensi,
 # tetapi perhitungan indikator menggunakan candle sebelumnya.
 EXCLUDE_LATEST_CANDLE_FROM_INDICATORS = True
+
+# Cache dibuat singkat agar data tetap segar sekaligus menghemat kuota API.
+ANALYSIS_CACHE_TTL_SECONDS = 30
+OHLC_CACHE_TTL_SECONDS = {
+    "5min": 45,
+    "15min": 90,
+    "30min": 180,
+    "1h": 300,
+}
+MAX_CONCURRENT_API_REQUESTS = 4
 
 
 # =============================================================================
@@ -138,6 +151,144 @@ class TimeframeResult:
     data_points: int
 
 
+@dataclass
+class CacheEntry:
+    """Menyimpan nilai cache beserta waktu pembuatan dan kedaluwarsa."""
+
+    value: Any
+    created_at: float
+    expires_at: float
+
+
+_OHLC_CACHE: dict[tuple[str, str], CacheEntry] = {}
+_ANALYSIS_CACHE: dict[str, CacheEntry] = {}
+_ANALYSIS_LOCKS: dict[str, asyncio.Lock] = {}
+_API_SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+
+def _normalize_symbol(symbol: str) -> str:
+    """Menormalkan symbol agar key cache konsisten."""
+    normalized = symbol.strip().upper()
+    if not normalized:
+        raise ValueError("Symbol tidak boleh kosong.")
+    return normalized
+
+
+def _get_analysis_lock(symbol: str) -> asyncio.Lock:
+    """Mengambil lock per symbol untuk mencegah request identik ganda."""
+    lock = _ANALYSIS_LOCKS.get(symbol)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ANALYSIS_LOCKS[symbol] = lock
+    return lock
+
+
+def _get_api_semaphore() -> asyncio.Semaphore:
+    """Membatasi jumlah request Twelve Data yang berjalan bersamaan."""
+    global _API_SEMAPHORE
+
+    if _API_SEMAPHORE is None:
+        _API_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_API_REQUESTS)
+
+    return _API_SEMAPHORE
+
+
+def _get_valid_cache_entry(
+    cache: dict[Any, CacheEntry],
+    key: Any,
+) -> Optional[CacheEntry]:
+    """Mengambil entry cache yang masih berlaku."""
+    entry = cache.get(key)
+    if entry is None:
+        return None
+
+    if time.monotonic() >= entry.expires_at:
+        cache.pop(key, None)
+        return None
+
+    return entry
+
+
+def _get_cached_ohlc(
+    symbol: str,
+    interval: str,
+) -> Optional[pd.DataFrame]:
+    """Mengambil salinan DataFrame OHLC dari cache."""
+    entry = _get_valid_cache_entry(
+        _OHLC_CACHE,
+        (symbol, interval),
+    )
+    if entry is None:
+        return None
+
+    return entry.value.copy(deep=True)
+
+
+def _set_cached_ohlc(
+    symbol: str,
+    interval: str,
+    dataframe: pd.DataFrame,
+) -> None:
+    """Menyimpan DataFrame OHLC ke cache dengan TTL per timeframe."""
+    ttl = OHLC_CACHE_TTL_SECONDS.get(interval, 60)
+    now = time.monotonic()
+
+    _OHLC_CACHE[(symbol, interval)] = CacheEntry(
+        value=dataframe.copy(deep=True),
+        created_at=now,
+        expires_at=now + ttl,
+    )
+
+
+def _get_cached_analysis(symbol: str) -> Optional[dict]:
+    """Mengambil salinan hasil analisis yang masih berlaku."""
+    entry = _get_valid_cache_entry(_ANALYSIS_CACHE, symbol)
+    if entry is None:
+        return None
+
+    result = copy.deepcopy(entry.value)
+    result["cache_hit"] = True
+    result["cache_age_seconds"] = round(
+        max(0.0, time.monotonic() - entry.created_at),
+        1,
+    )
+    return result
+
+
+def _set_cached_analysis(symbol: str, analysis: dict) -> None:
+    """Menyimpan hasil analisis lengkap ke cache."""
+    now = time.monotonic()
+    cached_value = copy.deepcopy(analysis)
+    cached_value["cache_hit"] = False
+    cached_value["cache_age_seconds"] = 0.0
+
+    _ANALYSIS_CACHE[symbol] = CacheEntry(
+        value=cached_value,
+        created_at=now,
+        expires_at=now + ANALYSIS_CACHE_TTL_SECONDS,
+    )
+
+
+def clear_caches(symbol: Optional[str] = None) -> None:
+    """
+    Menghapus cache secara manual.
+
+    symbol=None menghapus seluruh cache. Fungsi ini berguna untuk test,
+    maintenance, atau saat konfigurasi strategi berubah.
+    """
+    if symbol is None:
+        _OHLC_CACHE.clear()
+        _ANALYSIS_CACHE.clear()
+        return
+
+    normalized_symbol = _normalize_symbol(symbol)
+    _ANALYSIS_CACHE.pop(normalized_symbol, None)
+
+    for key in list(_OHLC_CACHE):
+        if key[0] == normalized_symbol:
+            _OHLC_CACHE.pop(key, None)
+
+
 # =============================================================================
 # 3. HELPER VALIDASI DAN FORMAT
 # =============================================================================
@@ -187,10 +338,23 @@ async def _fetch_ohlc(
     """
     Mengambil OHLC untuk satu timeframe.
 
-    Return:
-        DataFrame kronologis jika berhasil.
-        None jika timeframe tersebut gagal.
+    Data cache digunakan terlebih dahulu. Jika cache tidak tersedia atau sudah
+    kedaluwarsa, fungsi mengambil data dari Twelve Data dan menyimpannya kembali.
     """
+    normalized_symbol = _normalize_symbol(symbol)
+
+    cached_dataframe = _get_cached_ohlc(
+        normalized_symbol,
+        interval,
+    )
+    if cached_dataframe is not None:
+        logger.info(
+            "OHLC cache hit | symbol=%s | tf=%s",
+            normalized_symbol,
+            interval,
+        )
+        return cached_dataframe
+
     if not TWELVE_DATA_API_KEY:
         logger.error(
             "TWELVE_DATA_API_KEY belum diatur pada environment variable."
@@ -198,150 +362,159 @@ async def _fetch_ohlc(
         return None
 
     params = {
-        "symbol": symbol,
+        "symbol": normalized_symbol,
         "interval": interval,
         "outputsize": OUTPUT_SIZE,
         "apikey": TWELVE_DATA_API_KEY,
     }
 
+    semaphore = _get_api_semaphore()
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            async with session.get(BASE_URL, params=params) as response:
-                if response.status == 429:
-                    logger.warning(
-                        "Rate limit Twelve Data tercapai | symbol=%s | tf=%s",
-                        symbol,
-                        interval,
-                    )
-                    return None
-
-                if response.status >= 500:
-                    logger.warning(
-                        "Server Twelve Data error | status=%s | symbol=%s | "
-                        "tf=%s | percobaan=%s/%s",
-                        response.status,
-                        symbol,
-                        interval,
-                        attempt,
-                        MAX_RETRIES,
-                    )
-
-                    if attempt < MAX_RETRIES:
-                        await asyncio.sleep(
-                            RETRY_BACKOFF_SECONDS * attempt
+            async with semaphore:
+                async with session.get(BASE_URL, params=params) as response:
+                    if response.status == 429:
+                        logger.warning(
+                            "Rate limit Twelve Data tercapai | symbol=%s | tf=%s",
+                            normalized_symbol,
+                            interval,
                         )
-                        continue
+                        return None
 
-                    return None
+                    if response.status >= 500:
+                        logger.warning(
+                            "Server Twelve Data error | status=%s | symbol=%s | "
+                            "tf=%s | percobaan=%s/%s",
+                            response.status,
+                            normalized_symbol,
+                            interval,
+                            attempt,
+                            MAX_RETRIES,
+                        )
 
-                if response.status != 200:
-                    logger.warning(
-                        "HTTP Twelve Data tidak berhasil | status=%s | "
-                        "symbol=%s | tf=%s",
-                        response.status,
-                        symbol,
-                        interval,
-                    )
-                    return None
+                        if attempt < MAX_RETRIES:
+                            await asyncio.sleep(
+                                RETRY_BACKOFF_SECONDS * attempt
+                            )
+                            continue
 
-                try:
-                    data = await response.json(content_type=None)
-                except (aiohttp.ContentTypeError, ValueError):
-                    logger.exception(
-                        "Respons Twelve Data bukan JSON valid | "
-                        "symbol=%s | tf=%s",
-                        symbol,
-                        interval,
-                    )
-                    return None
+                        return None
 
-                if not isinstance(data, dict):
-                    logger.warning(
-                        "Format respons tidak valid | symbol=%s | tf=%s",
-                        symbol,
-                        interval,
-                    )
-                    return None
+                    if response.status != 200:
+                        logger.warning(
+                            "HTTP Twelve Data tidak berhasil | status=%s | "
+                            "symbol=%s | tf=%s",
+                            response.status,
+                            normalized_symbol,
+                            interval,
+                        )
+                        return None
 
-                if data.get("status") == "error":
-                    logger.warning(
-                        "Twelve Data error | symbol=%s | tf=%s | message=%s",
-                        symbol,
-                        interval,
-                        data.get("message", "Tidak diketahui"),
-                    )
-                    return None
+                    try:
+                        data = await response.json(content_type=None)
+                    except (aiohttp.ContentTypeError, ValueError):
+                        logger.exception(
+                            "Respons Twelve Data bukan JSON valid | "
+                            "symbol=%s | tf=%s",
+                            normalized_symbol,
+                            interval,
+                        )
+                        return None
 
-                values = data.get("values")
-                if not isinstance(values, list) or not values:
-                    logger.warning(
-                        "Data candle kosong | symbol=%s | tf=%s",
-                        symbol,
-                        interval,
-                    )
-                    return None
+            if not isinstance(data, dict):
+                logger.warning(
+                    "Format respons tidak valid | symbol=%s | tf=%s",
+                    normalized_symbol,
+                    interval,
+                )
+                return None
 
-                df = pd.DataFrame(values)
+            if data.get("status") == "error":
+                logger.warning(
+                    "Twelve Data error | symbol=%s | tf=%s | message=%s",
+                    normalized_symbol,
+                    interval,
+                    data.get("message", "Tidak diketahui"),
+                )
+                return None
 
-                required_columns = {
-                    "datetime",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                }
-                missing_columns = required_columns.difference(df.columns)
+            values = data.get("values")
+            if not isinstance(values, list) or not values:
+                logger.warning(
+                    "Data candle kosong | symbol=%s | tf=%s",
+                    normalized_symbol,
+                    interval,
+                )
+                return None
 
-                if missing_columns:
-                    logger.warning(
-                        "Kolom candle tidak lengkap | symbol=%s | tf=%s | "
-                        "missing=%s",
-                        symbol,
-                        interval,
-                        sorted(missing_columns),
-                    )
-                    return None
+            dataframe = pd.DataFrame(values)
 
-                df["datetime"] = pd.to_datetime(
-                    df["datetime"],
+            required_columns = {
+                "datetime",
+                "open",
+                "high",
+                "low",
+                "close",
+            }
+            missing_columns = required_columns.difference(dataframe.columns)
+
+            if missing_columns:
+                logger.warning(
+                    "Kolom candle tidak lengkap | symbol=%s | tf=%s | "
+                    "missing=%s",
+                    normalized_symbol,
+                    interval,
+                    sorted(missing_columns),
+                )
+                return None
+
+            dataframe["datetime"] = pd.to_datetime(
+                dataframe["datetime"],
+                errors="coerce",
+            )
+
+            numeric_columns = ["open", "high", "low", "close"]
+            for column in numeric_columns:
+                dataframe[column] = pd.to_numeric(
+                    dataframe[column],
                     errors="coerce",
                 )
 
-                numeric_columns = ["open", "high", "low", "close"]
-                for column in numeric_columns:
-                    df[column] = pd.to_numeric(
-                        df[column],
-                        errors="coerce",
-                    )
-
-                df = (
-                    df.dropna(
-                        subset=["datetime", *numeric_columns]
-                    )
-                    .sort_values("datetime")
-                    .drop_duplicates(
-                        subset=["datetime"],
-                        keep="last",
-                    )
-                    .reset_index(drop=True)
+            dataframe = (
+                dataframe.dropna(
+                    subset=["datetime", *numeric_columns]
                 )
+                .sort_values("datetime")
+                .drop_duplicates(
+                    subset=["datetime"],
+                    keep="last",
+                )
+                .reset_index(drop=True)
+            )
 
-                if df.empty:
-                    logger.warning(
-                        "Data candle tidak valid setelah dibersihkan | "
-                        "symbol=%s | tf=%s",
-                        symbol,
-                        interval,
-                    )
-                    return None
+            if dataframe.empty:
+                logger.warning(
+                    "Data candle tidak valid setelah dibersihkan | "
+                    "symbol=%s | tf=%s",
+                    normalized_symbol,
+                    interval,
+                )
+                return None
 
-                return df
+            _set_cached_ohlc(
+                normalized_symbol,
+                interval,
+                dataframe,
+            )
+
+            return dataframe.copy(deep=True)
 
         except asyncio.TimeoutError:
             logger.warning(
                 "Timeout fetch data | symbol=%s | tf=%s | "
                 "percobaan=%s/%s",
-                symbol,
+                normalized_symbol,
                 interval,
                 attempt,
                 MAX_RETRIES,
@@ -351,7 +524,7 @@ async def _fetch_ohlc(
             logger.warning(
                 "Koneksi Twelve Data gagal | symbol=%s | tf=%s | "
                 "percobaan=%s/%s | error=%s",
-                symbol,
+                normalized_symbol,
                 interval,
                 attempt,
                 MAX_RETRIES,
@@ -361,7 +534,7 @@ async def _fetch_ohlc(
         except Exception:
             logger.exception(
                 "Error tak terduga saat fetch data | symbol=%s | tf=%s",
-                symbol,
+                normalized_symbol,
                 interval,
             )
             return None
@@ -889,7 +1062,7 @@ def _build_reasons(
 # =============================================================================
 # 8. FUNGSI UTAMA ANALISIS
 # =============================================================================
-async def get_market_data(
+async def _build_market_analysis(
     symbol: str = DEFAULT_SYMBOL,
 ) -> dict:
     """
@@ -1186,6 +1359,51 @@ async def get_market_data(
             "belum menjadi probabilitas kemenangan."
         ),
     }
+
+
+async def get_market_data(
+    symbol: str = DEFAULT_SYMBOL,
+) -> dict:
+    """
+    Mengambil hasil analisis multi-timeframe dengan cache dan request coalescing.
+
+    Permintaan identik untuk symbol yang sama tidak akan menjalankan analisis
+    bersamaan. Hasil cache dikembalikan sebagai salinan agar pemanggil tidak
+    dapat mengubah data yang tersimpan.
+    """
+    normalized_symbol = _normalize_symbol(symbol)
+
+    cached_analysis = _get_cached_analysis(normalized_symbol)
+    if cached_analysis is not None:
+        logger.info(
+            "Analysis cache hit | symbol=%s | age=%.1fs",
+            normalized_symbol,
+            cached_analysis.get("cache_age_seconds", 0.0),
+        )
+        return cached_analysis
+
+    analysis_lock = _get_analysis_lock(normalized_symbol)
+
+    async with analysis_lock:
+        cached_analysis = _get_cached_analysis(normalized_symbol)
+        if cached_analysis is not None:
+            logger.info(
+                "Analysis cache hit after lock | symbol=%s | age=%.1fs",
+                normalized_symbol,
+                cached_analysis.get("cache_age_seconds", 0.0),
+            )
+            return cached_analysis
+
+        analysis = await _build_market_analysis(normalized_symbol)
+        analysis["cache_hit"] = False
+        analysis["cache_age_seconds"] = 0.0
+        analysis["analysis_cache_ttl_seconds"] = (
+            ANALYSIS_CACHE_TTL_SECONDS
+        )
+
+        _set_cached_analysis(normalized_symbol, analysis)
+
+        return copy.deepcopy(analysis)
 
 
 # =============================================================================
