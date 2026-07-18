@@ -16,6 +16,14 @@ Indikator saat ini:
     - Bollinger Bands 20,2
     - ATR 14
     - Momentum harga
+    - Support dan Resistance
+    - Swing High dan Swing Low
+    - HH, HL, LH, dan LL
+    - Break of Structure (BOS)
+    - Change of Character (CHoCH)
+    - Sideways Detection
+    - False Breakout Filter
+    - Candlestick Pattern
     - Multi-timeframe weighting
 
 Catatan penting:
@@ -124,14 +132,41 @@ MIN_COVERAGE_RATIO = 0.65
 MIN_DIRECTIONAL_AGREEMENT = 0.65
 MIN_CONFIDENCE_FOR_SIGNAL = 60.0
 
+# Konfigurasi price action dan market structure.
+SWING_WINDOW = 2
+STRUCTURE_LOOKBACK = 80
+LEVEL_CLUSTER_ATR_MULTIPLIER = 0.35
+NEAR_LEVEL_ATR_MULTIPLIER = 0.60
+BREAKOUT_ATR_BUFFER = 0.10
+BREAKOUT_LOOKBACK = 4
+FALSE_BREAKOUT_LOOKBACK = 3
+SIDEWAYS_LOOKBACK = 20
+SIDEWAYS_RANGE_ATR_THRESHOLD = 5.0
+SIDEWAYS_EFFICIENCY_THRESHOLD = 0.30
+SIDEWAYS_SLOPE_ATR_THRESHOLD = 0.15
+MIN_STRUCTURE_CONFIRMATION = 0.18
+MAX_SIDEWAYS_RATIO_FOR_SIGNAL = 0.60
+MAX_FALSE_BREAKOUT_AGAINST_RATIO = 0.25
+
+
+@dataclass(frozen=True)
+class SwingPoint:
+    """Swing high atau swing low yang sudah terkonfirmasi."""
+
+    index: int
+    price: float
+    kind: str
+    timestamp: str
+
 
 @dataclass
 class TimeframeResult:
     """
     Hasil analisis untuk satu timeframe.
 
-    Field lama tetap dipertahankan agar kompatibel:
-    timeframe, close, rsi, sma, bb_upper, bb_lower, bb_mid, atr, score.
+    Seluruh field lama tetap dipertahankan. Field tambahan memiliki default
+    agar kode eksternal yang masih membuat TimeframeResult versi lama tidak
+    langsung rusak.
     """
 
     timeframe: str
@@ -149,6 +184,26 @@ class TimeframeResult:
     momentum_score: float
     analyzed_candle_time: str
     data_points: int
+    support_level: Optional[float] = None
+    resistance_level: Optional[float] = None
+    support_strength: int = 0
+    resistance_strength: int = 0
+    last_swing_high: Optional[float] = None
+    last_swing_low: Optional[float] = None
+    swing_high_label: str = "N/A"
+    swing_low_label: str = "N/A"
+    market_structure: str = "Tidak cukup data"
+    detected_trend: str = "Sideways"
+    bos: Optional[str] = None
+    choch: Optional[str] = None
+    sideways: bool = False
+    false_breakout: Optional[str] = None
+    candlestick_patterns: tuple[str, ...] = ()
+    structure_score: float = 0.0
+    support_resistance_score: float = 0.0
+    candlestick_score: float = 0.0
+    sideways_efficiency: float = 0.0
+    breakout_level: Optional[float] = None
 
 
 @dataclass
@@ -646,38 +701,599 @@ def _calculate_atr(
 
 
 # =============================================================================
+# 6. PRICE ACTION, MARKET STRUCTURE, DAN CANDLESTICK
+# =============================================================================
+def _detect_swings(
+    df: pd.DataFrame,
+    window: int = SWING_WINDOW,
+) -> list[SwingPoint]:
+    """Mendeteksi swing high dan swing low yang sudah terkonfirmasi."""
+    if window < 1 or len(df) < ((window * 2) + 1):
+        return []
+
+    swings: list[SwingPoint] = []
+    highs = df["high"].to_numpy(dtype=float)
+    lows = df["low"].to_numpy(dtype=float)
+
+    for index in range(window, len(df) - window):
+        current_high = highs[index]
+        current_low = lows[index]
+
+        left_highs = highs[index - window:index]
+        right_highs = highs[index + 1:index + window + 1]
+        left_lows = lows[index - window:index]
+        right_lows = lows[index + 1:index + window + 1]
+
+        is_swing_high = (
+            current_high > float(np.max(left_highs))
+            and current_high >= float(np.max(right_highs))
+        )
+        is_swing_low = (
+            current_low < float(np.min(left_lows))
+            and current_low <= float(np.min(right_lows))
+        )
+
+        timestamp = str(df["datetime"].iloc[index])
+
+        if is_swing_high:
+            swings.append(
+                SwingPoint(
+                    index=index,
+                    price=float(current_high),
+                    kind="HIGH",
+                    timestamp=timestamp,
+                )
+            )
+
+        if is_swing_low:
+            swings.append(
+                SwingPoint(
+                    index=index,
+                    price=float(current_low),
+                    kind="LOW",
+                    timestamp=timestamp,
+                )
+            )
+
+    return sorted(swings, key=lambda item: (item.index, item.kind))
+
+
+def _compare_swing_values(
+    latest: float,
+    previous: float,
+    higher_label: str,
+    lower_label: str,
+    tolerance: float,
+) -> str:
+    """Memberikan label HH/LH atau HL/LL dengan toleransi ATR."""
+    if latest > previous + tolerance:
+        return higher_label
+    if latest < previous - tolerance:
+        return lower_label
+    return "EQ"
+
+
+def _classify_market_structure(
+    swings: list[SwingPoint],
+    atr_value: float,
+) -> dict:
+    """Mengklasifikasikan HH, HL, LH, LL dan skor struktur."""
+    swing_highs = [item for item in swings if item.kind == "HIGH"]
+    swing_lows = [item for item in swings if item.kind == "LOW"]
+    tolerance = max(atr_value * 0.05, np.finfo(float).eps)
+
+    high_label = "N/A"
+    low_label = "N/A"
+
+    if len(swing_highs) >= 2:
+        high_label = _compare_swing_values(
+            swing_highs[-1].price,
+            swing_highs[-2].price,
+            "HH",
+            "LH",
+            tolerance,
+        )
+
+    if len(swing_lows) >= 2:
+        low_label = _compare_swing_values(
+            swing_lows[-1].price,
+            swing_lows[-2].price,
+            "HL",
+            "LL",
+            tolerance,
+        )
+
+    if high_label == "HH" and low_label == "HL":
+        structure_score = 1.0
+    elif high_label == "LH" and low_label == "LL":
+        structure_score = -1.0
+    else:
+        components: list[float] = []
+        if high_label == "HH":
+            components.append(0.55)
+        elif high_label == "LH":
+            components.append(-0.55)
+
+        if low_label == "HL":
+            components.append(0.55)
+        elif low_label == "LL":
+            components.append(-0.55)
+
+        structure_score = (
+            float(np.mean(components)) if components else 0.0
+        )
+
+    if high_label == "N/A" and low_label == "N/A":
+        structure_label = "Tidak cukup data"
+    else:
+        structure_label = f"{high_label}-{low_label}"
+
+    return {
+        "high_label": high_label,
+        "low_label": low_label,
+        "structure_label": structure_label,
+        "structure_score": float(np.clip(structure_score, -1.0, 1.0)),
+        "last_swing_high": swing_highs[-1].price if swing_highs else None,
+        "last_swing_low": swing_lows[-1].price if swing_lows else None,
+    }
+
+
+def _cluster_swing_levels(
+    points: list[SwingPoint],
+    tolerance: float,
+) -> list[dict]:
+    """Menggabungkan swing berdekatan menjadi level support/resistance."""
+    if not points:
+        return []
+
+    clusters: list[dict] = []
+
+    for point in sorted(points, key=lambda item: item.price):
+        matched_cluster: Optional[dict] = None
+
+        for cluster in clusters:
+            if abs(point.price - cluster["price"]) <= tolerance:
+                matched_cluster = cluster
+                break
+
+        if matched_cluster is None:
+            clusters.append(
+                {
+                    "price": point.price,
+                    "strength": 1,
+                    "last_index": point.index,
+                }
+            )
+            continue
+
+        strength = matched_cluster["strength"]
+        matched_cluster["price"] = (
+            (matched_cluster["price"] * strength) + point.price
+        ) / (strength + 1)
+        matched_cluster["strength"] = strength + 1
+        matched_cluster["last_index"] = max(
+            matched_cluster["last_index"],
+            point.index,
+        )
+
+    return clusters
+
+
+def _detect_support_resistance(
+    swings: list[SwingPoint],
+    current_close: float,
+    atr_value: float,
+    dataframe_length: int,
+) -> tuple[Optional[float], Optional[float], int, int]:
+    """Menentukan support dan resistance terdekat dari cluster swing."""
+    recent_start = max(0, dataframe_length - STRUCTURE_LOOKBACK)
+    recent_swings = [
+        item for item in swings if item.index >= recent_start
+    ]
+
+    tolerance = max(
+        atr_value * LEVEL_CLUSTER_ATR_MULTIPLIER,
+        np.finfo(float).eps,
+    )
+
+    low_clusters = _cluster_swing_levels(
+        [item for item in recent_swings if item.kind == "LOW"],
+        tolerance,
+    )
+    high_clusters = _cluster_swing_levels(
+        [item for item in recent_swings if item.kind == "HIGH"],
+        tolerance,
+    )
+
+    support_candidates = [
+        cluster
+        for cluster in low_clusters
+        if cluster["price"] <= current_close + tolerance
+    ]
+    resistance_candidates = [
+        cluster
+        for cluster in high_clusters
+        if cluster["price"] >= current_close - tolerance
+    ]
+
+    if support_candidates:
+        support_cluster = max(
+            support_candidates,
+            key=lambda item: (item["price"], item["strength"]),
+        )
+    elif low_clusters:
+        support_cluster = min(
+            low_clusters,
+            key=lambda item: abs(item["price"] - current_close),
+        )
+    else:
+        support_cluster = None
+
+    if resistance_candidates:
+        resistance_cluster = min(
+            resistance_candidates,
+            key=lambda item: (item["price"], -item["strength"]),
+        )
+    elif high_clusters:
+        resistance_cluster = min(
+            high_clusters,
+            key=lambda item: abs(item["price"] - current_close),
+        )
+    else:
+        resistance_cluster = None
+
+    return (
+        support_cluster["price"] if support_cluster else None,
+        resistance_cluster["price"] if resistance_cluster else None,
+        support_cluster["strength"] if support_cluster else 0,
+        resistance_cluster["strength"] if resistance_cluster else 0,
+    )
+
+
+def _detect_break_event(
+    df: pd.DataFrame,
+    swings: list[SwingPoint],
+    atr_value: float,
+    prior_structure_score: float,
+) -> tuple[Optional[str], Optional[str], Optional[float]]:
+    """Mendeteksi BOS atau CHoCH berdasarkan penutupan candle."""
+    if len(df) < 2 or not swings:
+        return None, None, None
+
+    buffer = atr_value * BREAKOUT_ATR_BUFFER
+    start_index = max(1, len(df) - BREAKOUT_LOOKBACK)
+    events: list[tuple[int, str, float]] = []
+
+    for index in range(start_index, len(df)):
+        previous_close = float(df["close"].iloc[index - 1])
+        current_close = float(df["close"].iloc[index])
+
+        previous_highs = [
+            item
+            for item in swings
+            if item.kind == "HIGH" and item.index < index
+        ]
+        previous_lows = [
+            item
+            for item in swings
+            if item.kind == "LOW" and item.index < index
+        ]
+
+        if previous_highs:
+            reference_high = max(
+                previous_highs,
+                key=lambda item: item.index,
+            )
+            if (
+                previous_close <= reference_high.price + buffer
+                and current_close > reference_high.price + buffer
+            ):
+                events.append((index, "BULLISH", reference_high.price))
+
+        if previous_lows:
+            reference_low = max(
+                previous_lows,
+                key=lambda item: item.index,
+            )
+            if (
+                previous_close >= reference_low.price - buffer
+                and current_close < reference_low.price - buffer
+            ):
+                events.append((index, "BEARISH", reference_low.price))
+
+    if not events:
+        return None, None, None
+
+    _, direction, level = max(events, key=lambda item: item[0])
+
+    if direction == "BULLISH" and prior_structure_score <= -0.35:
+        return None, "BULLISH", level
+    if direction == "BEARISH" and prior_structure_score >= 0.35:
+        return None, "BEARISH", level
+
+    return direction, None, level
+
+
+def _detect_false_breakout(
+    df: pd.DataFrame,
+    support_level: Optional[float],
+    resistance_level: Optional[float],
+    atr_value: float,
+) -> Optional[str]:
+    """
+    Mendeteksi breakout wick yang gagal ditutup di luar level.
+
+    Return BULLISH berarti percobaan breakout ke atas gagal.
+    Return BEARISH berarti percobaan breakout ke bawah gagal.
+    """
+    if df.empty:
+        return None
+
+    buffer = atr_value * BREAKOUT_ATR_BUFFER
+    start_index = max(0, len(df) - FALSE_BREAKOUT_LOOKBACK)
+    events: list[tuple[int, str]] = []
+
+    for index in range(start_index, len(df)):
+        row = df.iloc[index]
+        candle_open = float(row["open"])
+        candle_high = float(row["high"])
+        candle_low = float(row["low"])
+        candle_close = float(row["close"])
+
+        if resistance_level is not None:
+            failed_upside = (
+                candle_high > resistance_level + buffer
+                and candle_close < resistance_level
+                and candle_open <= resistance_level + buffer
+            )
+            if failed_upside:
+                events.append((index, "BULLISH"))
+
+        if support_level is not None:
+            failed_downside = (
+                candle_low < support_level - buffer
+                and candle_close > support_level
+                and candle_open >= support_level - buffer
+            )
+            if failed_downside:
+                events.append((index, "BEARISH"))
+
+    if not events:
+        return None
+
+    return max(events, key=lambda item: item[0])[1]
+
+
+def _candle_parts(row: pd.Series) -> dict:
+    """Menghitung body dan wick candle secara aman."""
+    candle_open = float(row["open"])
+    candle_close = float(row["close"])
+    candle_high = float(row["high"])
+    candle_low = float(row["low"])
+    candle_range = max(candle_high - candle_low, np.finfo(float).eps)
+    body = abs(candle_close - candle_open)
+
+    return {
+        "open": candle_open,
+        "close": candle_close,
+        "high": candle_high,
+        "low": candle_low,
+        "range": candle_range,
+        "body": body,
+        "upper_wick": candle_high - max(candle_open, candle_close),
+        "lower_wick": min(candle_open, candle_close) - candle_low,
+        "bullish": candle_close > candle_open,
+        "bearish": candle_close < candle_open,
+    }
+
+
+def _detect_candlestick_patterns(
+    df: pd.DataFrame,
+    atr_value: float,
+) -> tuple[tuple[str, ...], float, bool]:
+    """Mendeteksi pola candlestick pada candle terakhir yang sudah tutup."""
+    if len(df) < 3:
+        return (), 0.0, False
+
+    last = _candle_parts(df.iloc[-1])
+    previous = _candle_parts(df.iloc[-2])
+    first = _candle_parts(df.iloc[-3])
+
+    patterns: list[str] = []
+    scores: list[float] = []
+
+    lookback_index = max(0, len(df) - 7)
+    earlier_close = float(df["close"].iloc[lookback_index])
+    recent_context_close = float(df["close"].iloc[-2])
+    downtrend_context = recent_context_close < earlier_close
+    uptrend_context = recent_context_close > earlier_close
+
+    doji = last["body"] <= (last["range"] * 0.10)
+    if doji:
+        patterns.append("Doji")
+
+    bullish_engulfing = (
+        last["bullish"]
+        and previous["bearish"]
+        and last["open"] <= previous["close"]
+        and last["close"] >= previous["open"]
+        and last["body"] >= previous["body"] * 0.90
+    )
+    bearish_engulfing = (
+        last["bearish"]
+        and previous["bullish"]
+        and last["open"] >= previous["close"]
+        and last["close"] <= previous["open"]
+        and last["body"] >= previous["body"] * 0.90
+    )
+
+    if bullish_engulfing:
+        patterns.append("Bullish Engulfing")
+        scores.append(0.80)
+    if bearish_engulfing:
+        patterns.append("Bearish Engulfing")
+        scores.append(-0.80)
+
+    meaningful_body = max(last["body"], atr_value * 0.03)
+
+    hammer = (
+        downtrend_context
+        and last["lower_wick"] >= meaningful_body * 2.0
+        and last["lower_wick"] >= last["range"] * 0.50
+        and last["upper_wick"] <= last["range"] * 0.20
+    )
+    shooting_star = (
+        uptrend_context
+        and last["upper_wick"] >= meaningful_body * 2.0
+        and last["upper_wick"] >= last["range"] * 0.50
+        and last["lower_wick"] <= last["range"] * 0.20
+    )
+
+    if hammer:
+        patterns.append("Hammer")
+        scores.append(0.65)
+    if shooting_star:
+        patterns.append("Shooting Star")
+        scores.append(-0.65)
+
+    bullish_pin_bar = (
+        not hammer
+        and last["lower_wick"] >= meaningful_body * 2.5
+        and last["lower_wick"] >= last["range"] * 0.55
+    )
+    bearish_pin_bar = (
+        not shooting_star
+        and last["upper_wick"] >= meaningful_body * 2.5
+        and last["upper_wick"] >= last["range"] * 0.55
+    )
+
+    if bullish_pin_bar:
+        patterns.append("Bullish Pin Bar")
+        scores.append(0.55)
+    if bearish_pin_bar:
+        patterns.append("Bearish Pin Bar")
+        scores.append(-0.55)
+
+    morning_star = (
+        downtrend_context
+        and first["bearish"]
+        and first["body"] >= atr_value * 0.30
+        and previous["body"] <= first["body"] * 0.55
+        and last["bullish"]
+        and last["body"] >= first["body"] * 0.40
+        and last["close"] >= (first["open"] + first["close"]) / 2.0
+    )
+    evening_star = (
+        uptrend_context
+        and first["bullish"]
+        and first["body"] >= atr_value * 0.30
+        and previous["body"] <= first["body"] * 0.55
+        and last["bearish"]
+        and last["body"] >= first["body"] * 0.40
+        and last["close"] <= (first["open"] + first["close"]) / 2.0
+    )
+
+    if morning_star:
+        patterns.append("Morning Star")
+        scores.append(1.0)
+    if evening_star:
+        patterns.append("Evening Star")
+        scores.append(-1.0)
+
+    positive_score = max([score for score in scores if score > 0], default=0.0)
+    negative_score = min([score for score in scores if score < 0], default=0.0)
+    pattern_score = float(
+        np.clip(positive_score + negative_score, -1.0, 1.0)
+    )
+
+    return tuple(dict.fromkeys(patterns)), pattern_score, doji
+
+
+def _detect_sideways_market(
+    df: pd.DataFrame,
+    atr_value: float,
+    structure_score: float,
+) -> tuple[bool, float]:
+    """Mendeteksi market sideways dari range, efficiency, slope, dan struktur."""
+    if len(df) < SIDEWAYS_LOOKBACK:
+        return False, 1.0
+
+    segment = df.iloc[-SIDEWAYS_LOOKBACK:]
+    close = segment["close"].astype(float)
+    market_range = float(segment["high"].max() - segment["low"].min())
+    range_atr_ratio = market_range / max(atr_value, np.finfo(float).eps)
+
+    travelled_distance = float(close.diff().abs().sum())
+    net_distance = abs(float(close.iloc[-1] - close.iloc[0]))
+    efficiency = (
+        net_distance / travelled_distance
+        if travelled_distance > 0
+        else 0.0
+    )
+
+    slope_lookback = min(5, len(close) - 1)
+    slope = abs(float(close.iloc[-1] - close.iloc[-1 - slope_lookback]))
+    normalized_slope = slope / (
+        max(atr_value, np.finfo(float).eps) * slope_lookback
+    )
+
+    conditions = [
+        range_atr_ratio <= SIDEWAYS_RANGE_ATR_THRESHOLD,
+        efficiency <= SIDEWAYS_EFFICIENCY_THRESHOLD,
+        normalized_slope <= SIDEWAYS_SLOPE_ATR_THRESHOLD,
+        abs(structure_score) < 0.55,
+    ]
+
+    return sum(conditions) >= 3, float(np.clip(efficiency, 0.0, 1.0))
+
+
+def _derive_trend_label(
+    sideways: bool,
+    structure_score: float,
+    trend_score: float,
+    momentum_score: float,
+) -> str:
+    """Menentukan Bullish, Bearish, atau Sideways."""
+    if sideways:
+        return "Sideways"
+
+    combined_direction = (
+        (0.55 * structure_score)
+        + (0.30 * trend_score)
+        + (0.15 * momentum_score)
+    )
+
+    if combined_direction >= 0.20:
+        return "Bullish"
+    if combined_direction <= -0.20:
+        return "Bearish"
+    return "Sideways"
+
+
+# =============================================================================
 # 6. ANALISIS SATU TIMEFRAME
 # =============================================================================
 def _score_timeframe(
     df: pd.DataFrame,
     timeframe: str,
 ) -> Optional[TimeframeResult]:
-    """
-    Menghitung indikator dan skor konfluensi untuk satu timeframe.
-
-    Skor:
-        -1.0 = bearish kuat
-         0.0 = netral
-        +1.0 = bullish kuat
-
-    Sistem menggunakan pendekatan trend-following agar RSI dan Bollinger
-    tidak otomatis melawan tren kuat.
-    """
+    """Menghitung indikator, price action, dan skor konfluensi timeframe."""
     minimum_rows = (
         max(
             RSI_PERIOD,
             SMA_PERIOD,
             BB_PERIOD,
             ATR_PERIOD,
+            SIDEWAYS_LOOKBACK,
         )
         + MOMENTUM_LOOKBACK
+        + (SWING_WINDOW * 2)
         + 2
     )
 
     if len(df) < minimum_rows:
         logger.warning(
-            "Data timeframe terlalu sedikit | tf=%s | tersedia=%s | "
-            "minimum=%s",
+            "Data timeframe terlalu sedikit | tf=%s | tersedia=%s | minimum=%s",
             timeframe,
             len(df),
             minimum_rows,
@@ -685,65 +1301,34 @@ def _score_timeframe(
         return None
 
     close = df["close"]
-
     rsi_series = _calculate_rsi(close)
     sma_series = close.rolling(
         window=SMA_PERIOD,
         min_periods=SMA_PERIOD,
     ).mean()
-
     bb_upper, bb_middle, bb_lower = _calculate_bollinger(close)
     atr_series = _calculate_atr(df)
 
     last_close = _safe_float(close.iloc[-1], "close")
     last_rsi = _safe_float(rsi_series.iloc[-1], "RSI")
     last_sma = _safe_float(sma_series.iloc[-1], "SMA")
-    last_bb_upper = _safe_float(
-        bb_upper.iloc[-1],
-        "Bollinger upper",
-    )
-    last_bb_lower = _safe_float(
-        bb_lower.iloc[-1],
-        "Bollinger lower",
-    )
-    last_bb_middle = _safe_float(
-        bb_middle.iloc[-1],
-        "Bollinger middle",
-    )
+    last_bb_upper = _safe_float(bb_upper.iloc[-1], "Bollinger upper")
+    last_bb_lower = _safe_float(bb_lower.iloc[-1], "Bollinger lower")
+    last_bb_middle = _safe_float(bb_middle.iloc[-1], "Bollinger middle")
     last_atr = _safe_float(atr_series.iloc[-1], "ATR")
 
     if last_atr <= 0:
-        logger.warning(
-            "ATR tidak valid | tf=%s | atr=%s",
-            timeframe,
-            last_atr,
-        )
+        logger.warning("ATR tidak valid | tf=%s | atr=%s", timeframe, last_atr)
         return None
 
-    # -------------------------------------------------------------------------
-    # A. Trend score: jarak harga terhadap SMA dinormalisasi menggunakan ATR.
-    # -------------------------------------------------------------------------
     trend_distance = (last_close - last_sma) / last_atr
-    trend_score = float(
-        np.clip(trend_distance / 1.5, -1.0, 1.0)
-    )
+    trend_score = float(np.clip(trend_distance / 1.5, -1.0, 1.0))
+    rsi_score = float(np.clip((last_rsi - 50.0) / 20.0, -1.0, 1.0))
 
-    # -------------------------------------------------------------------------
-    # B. RSI score: RSI di atas 50 mendukung bullish, di bawah 50 bearish.
-    # Overbought tidak otomatis dianggap SELL tanpa konfirmasi struktur.
-    # -------------------------------------------------------------------------
-    rsi_score = float(
-        np.clip((last_rsi - 50.0) / 20.0, -1.0, 1.0)
-    )
-
-    # -------------------------------------------------------------------------
-    # C. Bollinger score: posisi terhadap middle band mengikuti arah tren.
-    # -------------------------------------------------------------------------
     half_band_width = max(
         (last_bb_upper - last_bb_lower) / 2.0,
         np.finfo(float).eps,
     )
-
     bb_score = float(
         np.clip(
             (last_close - last_bb_middle) / half_band_width,
@@ -752,35 +1337,136 @@ def _score_timeframe(
         )
     )
 
-    # -------------------------------------------------------------------------
-    # D. Momentum score: perubahan beberapa candle dinormalisasi ATR.
-    # -------------------------------------------------------------------------
     momentum_start = _safe_float(
         close.iloc[-1 - MOMENTUM_LOOKBACK],
         "momentum start",
     )
-
     momentum_change = last_close - momentum_start
     momentum_score = float(
         np.clip(
-            momentum_change
-            / (last_atr * max(MOMENTUM_LOOKBACK, 1)),
+            momentum_change / (last_atr * max(MOMENTUM_LOOKBACK, 1)),
             -1.0,
             1.0,
         )
     )
 
-    # Bobot dibuat eksplisit agar mudah disesuaikan dan diuji.
-    total_score = (
-        (0.40 * trend_score)
-        + (0.25 * rsi_score)
-        + (0.20 * bb_score)
-        + (0.15 * momentum_score)
+    swings = _detect_swings(df)
+    structure = _classify_market_structure(swings, last_atr)
+
+    support_level, resistance_level, support_strength, resistance_strength = (
+        _detect_support_resistance(
+            swings,
+            last_close,
+            last_atr,
+            len(df),
+        )
     )
 
-    total_score = float(np.clip(total_score, -1.0, 1.0))
+    bos, choch, breakout_level = _detect_break_event(
+        df,
+        swings,
+        last_atr,
+        structure["structure_score"],
+    )
 
-    analyzed_candle_time = str(df["datetime"].iloc[-1])
+    breakout_component = 0.0
+    if bos == "BULLISH":
+        breakout_component = 0.35
+    elif bos == "BEARISH":
+        breakout_component = -0.35
+    elif choch == "BULLISH":
+        breakout_component = 0.55
+    elif choch == "BEARISH":
+        breakout_component = -0.55
+
+    structure_score = float(
+        np.clip(
+            (0.65 * structure["structure_score"]) + breakout_component,
+            -1.0,
+            1.0,
+        )
+    )
+
+    false_breakout = _detect_false_breakout(
+        df,
+        support_level,
+        resistance_level,
+        last_atr,
+    )
+
+    candlestick_patterns, candlestick_score, doji_detected = (
+        _detect_candlestick_patterns(df, last_atr)
+    )
+
+    support_resistance_score = 0.0
+
+    if bos == "BULLISH":
+        support_resistance_score += 0.80
+    elif bos == "BEARISH":
+        support_resistance_score -= 0.80
+
+    if choch == "BULLISH":
+        support_resistance_score += 1.0
+    elif choch == "BEARISH":
+        support_resistance_score -= 1.0
+
+    if false_breakout == "BULLISH":
+        support_resistance_score -= 0.70
+    elif false_breakout == "BEARISH":
+        support_resistance_score += 0.70
+
+    near_distance = last_atr * NEAR_LEVEL_ATR_MULTIPLIER
+
+    if (
+        support_level is not None
+        and abs(last_close - support_level) <= near_distance
+    ):
+        support_resistance_score += (
+            0.30 if candlestick_score >= 0 else 0.12
+        )
+
+    if (
+        resistance_level is not None
+        and abs(last_close - resistance_level) <= near_distance
+    ):
+        support_resistance_score -= (
+            0.30 if candlestick_score <= 0 else 0.12
+        )
+
+    support_resistance_score = float(
+        np.clip(support_resistance_score, -1.0, 1.0)
+    )
+
+    sideways, sideways_efficiency = _detect_sideways_market(
+        df,
+        last_atr,
+        structure_score,
+    )
+
+    detected_trend = _derive_trend_label(
+        sideways,
+        structure_score,
+        trend_score,
+        momentum_score,
+    )
+
+    total_score = (
+        (0.24 * trend_score)
+        + (0.14 * rsi_score)
+        + (0.10 * bb_score)
+        + (0.12 * momentum_score)
+        + (0.24 * structure_score)
+        + (0.09 * support_resistance_score)
+        + (0.07 * candlestick_score)
+    )
+
+    if sideways:
+        total_score *= 0.55
+
+    if doji_detected and abs(candlestick_score) < 0.40:
+        total_score *= 0.92
+
+    total_score = float(np.clip(total_score, -1.0, 1.0))
 
     return TimeframeResult(
         timeframe=timeframe,
@@ -796,8 +1482,28 @@ def _score_timeframe(
         rsi_score=rsi_score,
         bb_score=bb_score,
         momentum_score=momentum_score,
-        analyzed_candle_time=analyzed_candle_time,
+        analyzed_candle_time=str(df["datetime"].iloc[-1]),
         data_points=len(df),
+        support_level=support_level,
+        resistance_level=resistance_level,
+        support_strength=support_strength,
+        resistance_strength=resistance_strength,
+        last_swing_high=structure["last_swing_high"],
+        last_swing_low=structure["last_swing_low"],
+        swing_high_label=structure["high_label"],
+        swing_low_label=structure["low_label"],
+        market_structure=structure["structure_label"],
+        detected_trend=detected_trend,
+        bos=bos,
+        choch=choch,
+        sideways=sideways,
+        false_breakout=false_breakout,
+        candlestick_patterns=candlestick_patterns,
+        structure_score=structure_score,
+        support_resistance_score=support_resistance_score,
+        candlestick_score=candlestick_score,
+        sideways_efficiency=sideways_efficiency,
+        breakout_level=breakout_level,
     )
 
 
@@ -807,11 +1513,7 @@ def _score_timeframe(
 def _calculate_higher_timeframe_trend(
     timeframe_results: dict[str, TimeframeResult],
 ) -> tuple[str, float]:
-    """
-    Menentukan tren utama menggunakan 30m dan 1h.
-
-    Jika keduanya tidak tersedia, fungsi memakai semua timeframe yang tersedia.
-    """
+    """Menentukan tren utama menggunakan struktur 30m dan 1h."""
     selected_timeframes = [
         timeframe
         for timeframe in HIGHER_TIMEFRAMES
@@ -829,18 +1531,33 @@ def _calculate_higher_timeframe_trend(
     if total_weight <= 0:
         return "Sideways", 0.0
 
-    weighted_score = sum(
-        timeframe_results[timeframe].score
-        * TIMEFRAME_WEIGHTS[timeframe]
-        for timeframe in selected_timeframes
-    )
+    bullish_weight = 0.0
+    bearish_weight = 0.0
+    weighted_score = 0.0
+
+    for timeframe in selected_timeframes:
+        result = timeframe_results[timeframe]
+        weight = TIMEFRAME_WEIGHTS[timeframe]
+        score_multiplier = 0.35 if result.sideways else 1.0
+        weighted_score += result.score * weight * score_multiplier
+
+        if result.detected_trend == "Bullish":
+            bullish_weight += weight
+        elif result.detected_trend == "Bearish":
+            bearish_weight += weight
 
     trend_score = weighted_score / total_weight
 
-    if trend_score >= TIMEFRAME_BIAS_THRESHOLD:
+    if (
+        bullish_weight / total_weight >= 0.55
+        and trend_score >= 0.10
+    ):
         return "Bullish", trend_score
 
-    if trend_score <= -TIMEFRAME_BIAS_THRESHOLD:
+    if (
+        bearish_weight / total_weight >= 0.55
+        and trend_score <= -0.10
+    ):
         return "Bearish", trend_score
 
     return "Sideways", trend_score
@@ -880,31 +1597,145 @@ def _calculate_directional_agreement(
     return supporting_weight / available_weight
 
 
+def _calculate_structure_confirmation(
+    timeframe_results: dict[str, TimeframeResult],
+    candidate_signal: str,
+) -> float:
+    """Mengukur konfirmasi struktur yang searah dengan calon sinyal."""
+    if candidate_signal not in {"BUY", "SELL"}:
+        return 0.0
+
+    signal_sign = 1.0 if candidate_signal == "BUY" else -1.0
+    target_direction = "BULLISH" if candidate_signal == "BUY" else "BEARISH"
+    supporting_false_breakout = (
+        "BEARISH" if candidate_signal == "BUY" else "BULLISH"
+    )
+
+    total_weight = 0.0
+    confirmed_weight = 0.0
+
+    for timeframe, result in timeframe_results.items():
+        weight = TIMEFRAME_WEIGHTS[timeframe]
+        confirmation = max(0.0, signal_sign * result.structure_score)
+
+        if result.bos == target_direction:
+            confirmation = max(confirmation, 0.75)
+        if result.choch == target_direction:
+            confirmation = max(confirmation, 0.90)
+        if result.false_breakout == supporting_false_breakout:
+            confirmation = max(confirmation, 0.55)
+        if result.sideways:
+            confirmation *= 0.50
+
+        total_weight += weight
+        confirmed_weight += confirmation * weight
+
+    return confirmed_weight / total_weight if total_weight > 0 else 0.0
+
+
+def _calculate_pattern_confirmation(
+    timeframe_results: dict[str, TimeframeResult],
+    candidate_signal: str,
+) -> float:
+    """Mengukur konfirmasi pola candlestick searah calon sinyal."""
+    if candidate_signal not in {"BUY", "SELL"}:
+        return 0.0
+
+    signal_sign = 1.0 if candidate_signal == "BUY" else -1.0
+    total_weight = 0.0
+    confirmed_weight = 0.0
+
+    for timeframe, result in timeframe_results.items():
+        weight = TIMEFRAME_WEIGHTS[timeframe]
+        confirmation = max(0.0, signal_sign * result.candlestick_score)
+        total_weight += weight
+        confirmed_weight += confirmation * weight
+
+    return confirmed_weight / total_weight if total_weight > 0 else 0.0
+
+
+def _calculate_sideways_ratio(
+    timeframe_results: dict[str, TimeframeResult],
+) -> float:
+    """Menghitung bobot timeframe yang terdeteksi sideways."""
+    total_weight = sum(
+        TIMEFRAME_WEIGHTS[timeframe]
+        for timeframe in timeframe_results
+    )
+    if total_weight <= 0:
+        return 0.0
+
+    sideways_weight = sum(
+        TIMEFRAME_WEIGHTS[timeframe]
+        for timeframe, result in timeframe_results.items()
+        if result.sideways
+    )
+    return sideways_weight / total_weight
+
+
+def _calculate_false_breakout_against_ratio(
+    timeframe_results: dict[str, TimeframeResult],
+    candidate_signal: str,
+) -> float:
+    """Mengukur false breakout yang bertentangan dengan calon sinyal."""
+    if candidate_signal not in {"BUY", "SELL"}:
+        return 0.0
+
+    against_direction = (
+        "BULLISH" if candidate_signal == "BUY" else "BEARISH"
+    )
+    total_weight = sum(
+        TIMEFRAME_WEIGHTS[timeframe]
+        for timeframe in timeframe_results
+    )
+    if total_weight <= 0:
+        return 0.0
+
+    against_weight = sum(
+        TIMEFRAME_WEIGHTS[timeframe]
+        for timeframe, result in timeframe_results.items()
+        if result.false_breakout == against_direction
+    )
+    return against_weight / total_weight
+
+
 def _calculate_confidence_score(
     combined_score: float,
     directional_agreement: float,
     coverage_ratio: float,
+    structure_confirmation: float = 0.0,
+    pattern_confirmation: float = 0.0,
+    sideways_ratio: float = 0.0,
+    false_breakout_against_ratio: float = 0.0,
 ) -> float:
     """
     Menghitung Confidence Score konfluensi internal.
 
-    Komponen:
-    - 50% kekuatan combined score
-    - 30% keselarasan timeframe
-    - 20% kelengkapan data timeframe
-
-    Skor ini bukan probabilitas kemenangan.
+    Struktur market dan candlestick dapat meningkatkan confidence jika searah.
+    Sideways dan false breakout yang melawan arah mengurangi confidence.
     """
-    normalized_strength = min(
-        abs(combined_score) / 0.60,
-        1.0,
-    )
+    normalized_strength = min(abs(combined_score) / 0.60, 1.0)
 
     confidence = 100.0 * (
-        (0.50 * normalized_strength)
-        + (0.30 * directional_agreement)
-        + (0.20 * coverage_ratio)
+        (0.38 * normalized_strength)
+        + (0.22 * directional_agreement)
+        + (0.15 * coverage_ratio)
+        + (0.17 * structure_confirmation)
+        + (0.08 * pattern_confirmation)
     )
+
+    penalty_multiplier = (
+        1.0
+        - (0.22 * float(np.clip(sideways_ratio, 0.0, 1.0)))
+        - (
+            0.35
+            * float(
+                np.clip(false_breakout_against_ratio, 0.0, 1.0)
+            )
+        )
+    )
+
+    confidence *= max(0.35, penalty_multiplier)
 
     return round(float(np.clip(confidence, 0.0, 100.0)), 1)
 
@@ -914,19 +1745,21 @@ def _classify_signal_risk(
     confidence_pct: float,
     directional_agreement: float,
     coverage_ratio: float,
+    sideways_ratio: float = 0.0,
+    false_breakout_against_ratio: float = 0.0,
 ) -> str:
-    """
-    Mengklasifikasikan risiko kualitas sinyal.
-
-    Ini bukan pengukuran risiko akun atau position sizing.
-    """
+    """Mengklasifikasikan risiko kualitas sinyal."""
     if signal == "HOLD":
+        return "Tinggi"
+
+    if false_breakout_against_ratio > 0.0 or sideways_ratio > 0.50:
         return "Tinggi"
 
     if (
         confidence_pct >= 80.0
         and directional_agreement >= 0.80
         and coverage_ratio >= 0.90
+        and sideways_ratio <= 0.25
     ):
         return "Rendah"
 
@@ -948,10 +1781,12 @@ def _build_reasons(
     directional_agreement: float,
     trend: str,
     missing_timeframes: list[str],
+    structure_confirmation: float = 0.0,
+    pattern_confirmation: float = 0.0,
+    sideways_ratio: float = 0.0,
+    false_breakout_against_ratio: float = 0.0,
 ) -> list[str]:
-    """
-    Membuat alasan analisis yang mudah dipahami manusia.
-    """
+    """Membuat alasan analisis yang mudah dipahami manusia."""
     reasons: list[str] = []
 
     if signal == "HOLD":
@@ -959,33 +1794,37 @@ def _build_reasons(
             reasons.append(
                 "Kekuatan skor gabungan belum melewati ambang sinyal."
             )
-
         if confidence_pct < MIN_CONFIDENCE_FOR_SIGNAL:
             reasons.append(
                 "Confidence Score belum memenuhi batas minimum."
             )
-
         if directional_agreement < MIN_DIRECTIONAL_AGREEMENT:
             reasons.append(
                 "Arah antar-timeframe belum cukup selaras."
             )
-
         if coverage_ratio < MIN_COVERAGE_RATIO:
             reasons.append(
                 "Data timeframe yang tersedia belum cukup lengkap."
             )
-
-        if trend == "Sideways":
+        if trend == "Sideways" or sideways_ratio > 0.50:
             reasons.append(
-                "Timeframe besar belum menunjukkan tren yang jelas."
+                "Market terdeteksi sideways atau tren timeframe besar belum jelas."
             )
-
+        if false_breakout_against_ratio > 0.0:
+            reasons.append(
+                "False breakout terdeteksi melawan calon arah sinyal."
+            )
+        if structure_confirmation < MIN_STRUCTURE_CONFIRMATION:
+            reasons.append(
+                "HH/HL, LH/LL, BOS, atau CHoCH belum memberi konfirmasi kuat."
+            )
         if not reasons:
             reasons.append(
                 "Konfirmasi belum memenuhi seluruh aturan konservatif."
             )
 
     else:
+        target_direction = "BULLISH" if signal == "BUY" else "BEARISH"
         direction_word = "bullish" if signal == "BUY" else "bearish"
 
         if trend in {"Bullish", "Bearish"}:
@@ -998,52 +1837,48 @@ def _build_reasons(
             if result is None:
                 continue
 
-            supports_signal = (
-                signal == "BUY"
-                and result.score >= TIMEFRAME_BIAS_THRESHOLD
-            ) or (
-                signal == "SELL"
-                and result.score <= -TIMEFRAME_BIAS_THRESHOLD
-            )
-
-            if not supports_signal:
-                continue
-
             label = TIMEFRAME_LABELS.get(timeframe, timeframe)
-            price_position = (
-                "di atas"
-                if result.close > result.sma
-                else "di bawah"
-            )
 
-            reasons.append(
-                f"{label} mendukung {direction_word}: harga {price_position} "
-                f"SMA20 dan skor timeframe {result.score:+.2f}."
-            )
+            if result.choch == target_direction:
+                reasons.append(
+                    f"CHoCH {direction_word} terkonfirmasi pada {label}."
+                )
+            elif result.bos == target_direction:
+                reasons.append(
+                    f"BOS {direction_word} terkonfirmasi pada {label}."
+                )
 
-            if len(reasons) >= 4:
+            structure_supports = (
+                signal == "BUY" and result.structure_score > 0.25
+            ) or (
+                signal == "SELL" and result.structure_score < -0.25
+            )
+            if structure_supports:
+                reasons.append(
+                    f"Struktur {label} membentuk {result.market_structure}."
+                )
+
+            pattern_supports = (
+                signal == "BUY" and result.candlestick_score > 0.25
+            ) or (
+                signal == "SELL" and result.candlestick_score < -0.25
+            )
+            if pattern_supports and result.candlestick_patterns:
+                reasons.append(
+                    f"Pola {result.candlestick_patterns[0]} mendukung pada {label}."
+                )
+
+            if len(reasons) >= 5:
                 break
 
-        if signal == "BUY":
-            supporting_rsi = [
-                result.rsi
-                for result in timeframe_results.values()
-                if result.score >= TIMEFRAME_BIAS_THRESHOLD
-            ]
-            if supporting_rsi and max(supporting_rsi) < 75:
-                reasons.append(
-                    "RSI timeframe pendukung belum berada pada ekstrem bullish."
-                )
-        else:
-            supporting_rsi = [
-                result.rsi
-                for result in timeframe_results.values()
-                if result.score <= -TIMEFRAME_BIAS_THRESHOLD
-            ]
-            if supporting_rsi and min(supporting_rsi) > 25:
-                reasons.append(
-                    "RSI timeframe pendukung belum berada pada ekstrem bearish."
-                )
+        if structure_confirmation >= 0.45:
+            reasons.append(
+                "Konfirmasi market structure searah dengan sinyal."
+            )
+        if pattern_confirmation >= 0.40:
+            reasons.append(
+                "Candlestick pattern meningkatkan konfluensi sinyal."
+            )
 
     if missing_timeframes:
         labels = [
@@ -1065,31 +1900,13 @@ def _build_reasons(
 async def _build_market_analysis(
     symbol: str = DEFAULT_SYMBOL,
 ) -> dict:
-    """
-    Mengambil dan menganalisis market secara multi-timeframe.
-
-    Return utama:
-        signal:
-            BUY | SELL | HOLD
-
-        direction:
-            BUY | SELL | NEUTRAL
-            Field kompatibilitas untuk kode lama.
-
-        confidence_pct:
-            Skor kualitas konfluensi internal 0-100.
-
-        tp:
-            Alias kompatibilitas untuk tp2.
-    """
+    """Mengambil dan menganalisis market secara multi-timeframe."""
     if not TWELVE_DATA_API_KEY:
         raise RuntimeError(
             "TWELVE_DATA_API_KEY belum diatur pada environment variable."
         )
 
-    timeout = aiohttp.ClientTimeout(
-        total=REQUEST_TIMEOUT_SECONDS
-    )
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
 
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -1097,27 +1914,21 @@ async def _build_market_analysis(
                 _fetch_ohlc(session, symbol, timeframe)
                 for timeframe in TIMEFRAMES
             ]
-
             dataframes = await asyncio.gather(*fetch_tasks)
-
     except asyncio.TimeoutError as exc:
         raise RuntimeError(
             "Permintaan data pasar melewati batas waktu."
         ) from exc
-
     except aiohttp.ClientError as exc:
         raise RuntimeError(
             "Tidak dapat terhubung ke Twelve Data."
         ) from exc
-
     except Exception as exc:
         logger.exception(
             "Gagal membuat sesi atau mengambil data | symbol=%s",
             symbol,
         )
-        raise RuntimeError(
-            "Tidak dapat mengambil data pasar."
-        ) from exc
+        raise RuntimeError("Tidak dapat mengambil data pasar.") from exc
 
     timeframe_results: dict[str, TimeframeResult] = {}
     latest_prices: dict[str, float] = {}
@@ -1144,19 +1955,16 @@ async def _build_market_analysis(
                     SMA_PERIOD,
                     BB_PERIOD,
                     ATR_PERIOD,
+                    SIDEWAYS_LOOKBACK,
                 )
                 + MOMENTUM_LOOKBACK
+                + (SWING_WINDOW * 2)
                 + 2
             )
-
             if len(dataframe) > minimum_after_exclusion:
                 analysis_dataframe = dataframe.iloc[:-1].copy()
 
-        result = _score_timeframe(
-            analysis_dataframe,
-            timeframe,
-        )
-
+        result = _score_timeframe(analysis_dataframe, timeframe)
         if result is not None:
             timeframe_results[timeframe] = result
 
@@ -1186,38 +1994,72 @@ async def _build_market_analysis(
     else:
         candidate_signal = "HOLD"
 
-    trend, higher_timeframe_score = (
-        _calculate_higher_timeframe_trend(timeframe_results)
+    trend, higher_timeframe_score = _calculate_higher_timeframe_trend(
+        timeframe_results
     )
-
     directional_agreement = _calculate_directional_agreement(
         timeframe_results,
         candidate_signal,
+    )
+    structure_confirmation = _calculate_structure_confirmation(
+        timeframe_results,
+        candidate_signal,
+    )
+    pattern_confirmation = _calculate_pattern_confirmation(
+        timeframe_results,
+        candidate_signal,
+    )
+    sideways_ratio = _calculate_sideways_ratio(timeframe_results)
+    false_breakout_against_ratio = (
+        _calculate_false_breakout_against_ratio(
+            timeframe_results,
+            candidate_signal,
+        )
     )
 
     confidence_pct = _calculate_confidence_score(
         combined_score,
         directional_agreement,
         coverage_ratio,
+        structure_confirmation,
+        pattern_confirmation,
+        sideways_ratio,
+        false_breakout_against_ratio,
     )
 
-    enough_timeframes = (
-        len(timeframe_results) >= MIN_TIMEFRAMES_FOR_SIGNAL
-    )
+    enough_timeframes = len(timeframe_results) >= MIN_TIMEFRAMES_FOR_SIGNAL
     enough_coverage = coverage_ratio >= MIN_COVERAGE_RATIO
     enough_agreement = (
         directional_agreement >= MIN_DIRECTIONAL_AGREEMENT
     )
-    enough_confidence = (
-        confidence_pct >= MIN_CONFIDENCE_FOR_SIGNAL
+    enough_confidence = confidence_pct >= MIN_CONFIDENCE_FOR_SIGNAL
+    enough_structure = (
+        structure_confirmation >= MIN_STRUCTURE_CONFIRMATION
+        or abs(combined_score) >= 0.45
+    )
+    not_too_sideways = sideways_ratio <= MAX_SIDEWAYS_RATIO_FOR_SIGNAL
+    false_breakout_filter_passed = (
+        false_breakout_against_ratio
+        <= MAX_FALSE_BREAKOUT_AGAINST_RATIO
+    )
+
+    higher_timeframe_false_breakout = any(
+        (
+            candidate_signal == "BUY"
+            and timeframe_results[timeframe].false_breakout == "BULLISH"
+        )
+        or (
+            candidate_signal == "SELL"
+            and timeframe_results[timeframe].false_breakout == "BEARISH"
+        )
+        for timeframe in HIGHER_TIMEFRAMES
+        if timeframe in timeframe_results
     )
 
     trend_aligned = (
-        candidate_signal == "BUY"
-        and trend == "Bullish"
+        candidate_signal == "BUY" and trend == "Bullish"
     ) or (
-        candidate_signal == "SELL"
-        and trend == "Bearish"
+        candidate_signal == "SELL" and trend == "Bearish"
     )
 
     if (
@@ -1226,13 +2068,16 @@ async def _build_market_analysis(
         and enough_coverage
         and enough_agreement
         and enough_confidence
+        and enough_structure
+        and not_too_sideways
+        and false_breakout_filter_passed
+        and not higher_timeframe_false_breakout
         and trend_aligned
     ):
         signal = candidate_signal
     else:
         signal = "HOLD"
 
-    # Field direction dipertahankan untuk kompatibilitas lama.
     direction = "NEUTRAL" if signal == "HOLD" else signal
 
     reference_timeframe = (
@@ -1240,7 +2085,6 @@ async def _build_market_analysis(
         if ENTRY_TIMEFRAME_FOR_ATR in timeframe_results
         else next(iter(timeframe_results))
     )
-
     reference_result = timeframe_results[reference_timeframe]
     entry_price = latest_prices.get(
         reference_timeframe,
@@ -1254,40 +2098,15 @@ async def _build_market_analysis(
     take_profit_3: Optional[float] = None
 
     if signal == "BUY":
-        stop_loss = (
-            entry_price
-            - (ATR_SL_MULTIPLIER * atr_value)
-        )
-        take_profit_1 = (
-            entry_price
-            + (ATR_TP1_MULTIPLIER * atr_value)
-        )
-        take_profit_2 = (
-            entry_price
-            + (ATR_TP2_MULTIPLIER * atr_value)
-        )
-        take_profit_3 = (
-            entry_price
-            + (ATR_TP3_MULTIPLIER * atr_value)
-        )
-
+        stop_loss = entry_price - (ATR_SL_MULTIPLIER * atr_value)
+        take_profit_1 = entry_price + (ATR_TP1_MULTIPLIER * atr_value)
+        take_profit_2 = entry_price + (ATR_TP2_MULTIPLIER * atr_value)
+        take_profit_3 = entry_price + (ATR_TP3_MULTIPLIER * atr_value)
     elif signal == "SELL":
-        stop_loss = (
-            entry_price
-            + (ATR_SL_MULTIPLIER * atr_value)
-        )
-        take_profit_1 = (
-            entry_price
-            - (ATR_TP1_MULTIPLIER * atr_value)
-        )
-        take_profit_2 = (
-            entry_price
-            - (ATR_TP2_MULTIPLIER * atr_value)
-        )
-        take_profit_3 = (
-            entry_price
-            - (ATR_TP3_MULTIPLIER * atr_value)
-        )
+        stop_loss = entry_price + (ATR_SL_MULTIPLIER * atr_value)
+        take_profit_1 = entry_price - (ATR_TP1_MULTIPLIER * atr_value)
+        take_profit_2 = entry_price - (ATR_TP2_MULTIPLIER * atr_value)
+        take_profit_3 = entry_price - (ATR_TP3_MULTIPLIER * atr_value)
 
     missing_timeframes = [
         timeframe
@@ -1300,6 +2119,8 @@ async def _build_market_analysis(
         confidence_pct,
         directional_agreement,
         coverage_ratio,
+        sideways_ratio,
+        false_breakout_against_ratio,
     )
 
     reasons = _build_reasons(
@@ -1311,20 +2132,25 @@ async def _build_market_analysis(
         directional_agreement=directional_agreement,
         trend=trend,
         missing_timeframes=missing_timeframes,
+        structure_confirmation=structure_confirmation,
+        pattern_confirmation=pattern_confirmation,
+        sideways_ratio=sideways_ratio,
+        false_breakout_against_ratio=false_breakout_against_ratio,
     )
 
     logger.info(
-        "Analisis multi-timeframe selesai | symbol=%s | signal=%s | "
-        "score=%.3f | confidence=%.1f | agreement=%.2f | coverage=%.2f | "
-        "trend=%s | available_tf=%s",
+        "Analisis selesai | symbol=%s | signal=%s | score=%.3f | "
+        "confidence=%.1f | structure=%.2f | pattern=%.2f | "
+        "sideways=%.2f | false_breakout=%.2f | trend=%s",
         symbol,
         signal,
         combined_score,
         confidence_pct,
-        directional_agreement,
-        coverage_ratio,
+        structure_confirmation,
+        pattern_confirmation,
+        sideways_ratio,
+        false_breakout_against_ratio,
         trend,
-        list(timeframe_results.keys()),
     )
 
     return {
@@ -1354,6 +2180,33 @@ async def _build_market_analysis(
         "missing_timeframes": missing_timeframes,
         "available_timeframes": list(timeframe_results.keys()),
         "latest_data_times": latest_data_times,
+        "support": reference_result.support_level,
+        "resistance": reference_result.resistance_level,
+        "market_structure": reference_result.market_structure,
+        "bos": reference_result.bos,
+        "choch": reference_result.choch,
+        "sideways": reference_result.sideways,
+        "false_breakout": reference_result.false_breakout,
+        "candlestick_patterns": list(
+            reference_result.candlestick_patterns
+        ),
+        "structure_confirmation_pct": round(
+            structure_confirmation * 100,
+            1,
+        ),
+        "pattern_confirmation_pct": round(
+            pattern_confirmation * 100,
+            1,
+        ),
+        "sideways_ratio_pct": round(sideways_ratio * 100, 1),
+        "false_breakout_against_pct": round(
+            false_breakout_against_ratio * 100,
+            1,
+        ),
+        "false_breakout_filter_passed": (
+            false_breakout_filter_passed
+            and not higher_timeframe_false_breakout
+        ),
         "confidence_note": (
             "Confidence Score adalah skor konfluensi internal dan "
             "belum menjadi probabilitas kemenangan."
@@ -1410,14 +2263,9 @@ async def get_market_data(
 # 9. FORMAT PESAN TELEGRAM
 # =============================================================================
 def generate_signal_message(analysis: dict) -> str:
-    """
-    Mengubah hasil get_market_data() menjadi pesan Markdown Telegram.
-    """
+    """Mengubah hasil analisis menjadi pesan Markdown Telegram."""
     symbol = analysis["symbol"]
-    signal = analysis.get(
-        "signal",
-        analysis.get("direction", "HOLD"),
-    )
+    signal = analysis.get("signal", analysis.get("direction", "HOLD"))
     confidence = analysis["confidence_pct"]
     trend = analysis.get("trend", "Sideways")
     risk = analysis.get("risk", "Tinggi")
@@ -1445,41 +2293,74 @@ def generate_signal_message(analysis: dict) -> str:
     reasons = analysis.get("reasons") or [
         "Belum ada alasan analisis yang tersedia."
     ]
-
     for reason in reasons:
         lines.append(f"• {reason}")
 
-    lines.extend(
-        [
-            "",
-            "*Detail per Timeframe:*",
-        ]
-    )
+    lines.extend(["", "*Detail per Timeframe:*"])
 
     for timeframe in TIMEFRAMES:
         result = analysis["timeframes"].get(timeframe)
         label = TIMEFRAME_LABELS.get(timeframe, timeframe)
 
         if result is None:
-            lines.append(
-                f"• *{label}*: data tidak tersedia"
-            )
+            lines.append(f"• *{label}*: data tidak tersedia")
             continue
 
         bias = _timeframe_bias(result.score)
-
         price_position = (
-            "di atas"
-            if result.close > result.sma
-            else "di bawah"
+            "di atas" if result.close > result.sma else "di bawah"
+        )
+
+        event_labels: list[str] = []
+        if result.choch:
+            event_labels.append(f"CHoCH {result.choch.title()}")
+        elif result.bos:
+            event_labels.append(f"BOS {result.bos.title()}")
+        if result.sideways:
+            event_labels.append("Sideways")
+        if result.false_breakout:
+            event_labels.append(
+                f"False BO {result.false_breakout.title()}"
+            )
+
+        event_text = (
+            " | " + ", ".join(event_labels)
+            if event_labels
+            else ""
         )
 
         lines.append(
-            f"• *{label}*: {bias} | "
-            f"Score {result.score:+.2f} | "
-            f"RSI {result.rsi:.1f} | "
-            f"Harga {price_position} SMA20"
+            f"• *{label}*: {bias} | Score {result.score:+.2f} | "
+            f"RSI {result.rsi:.1f} | Harga {price_position} SMA20 | "
+            f"Struktur {result.market_structure}{event_text}"
         )
+
+    reference_timeframe = analysis.get(
+        "atr_reference_tf",
+        ENTRY_TIMEFRAME_FOR_ATR,
+    )
+    reference_result = analysis["timeframes"].get(reference_timeframe)
+
+    if reference_result is not None:
+        lines.extend(["", "*Struktur & Price Action:*"])
+
+        if reference_result.support_level is not None:
+            lines.append(
+                f"• Support: {reference_result.support_level:.{decimals}f} "
+                f"(strength {reference_result.support_strength})"
+            )
+        if reference_result.resistance_level is not None:
+            lines.append(
+                f"• Resistance: {reference_result.resistance_level:.{decimals}f} "
+                f"(strength {reference_result.resistance_strength})"
+            )
+        if reference_result.candlestick_patterns:
+            lines.append(
+                "• Pola candle: "
+                + ", ".join(reference_result.candlestick_patterns[:3])
+            )
+        if not reference_result.candlestick_patterns:
+            lines.append("• Pola candle: tidak ada pola kuat")
 
     lines.append("")
 
@@ -1500,7 +2381,7 @@ def generate_signal_message(analysis: dict) -> str:
                 "",
                 (
                     f"_SL/TP menggunakan ATR({ATR_PERIOD}) timeframe "
-                    f"{TIMEFRAME_LABELS.get(analysis['atr_reference_tf'], analysis['atr_reference_tf'])}._"
+                    f"{TIMEFRAME_LABELS.get(reference_timeframe, reference_timeframe)}._"
                 ),
             ]
         )
@@ -1518,6 +2399,12 @@ def generate_signal_message(analysis: dict) -> str:
                 f"{analysis.get('directional_agreement_pct', 0):.1f}%_"
             ),
             (
+                f"_Konfirmasi struktur: "
+                f"{analysis.get('structure_confirmation_pct', 0):.1f}% | "
+                f"Konfirmasi candle: "
+                f"{analysis.get('pattern_confirmation_pct', 0):.1f}%_"
+            ),
+            (
                 "_Confidence Score adalah skor konfluensi internal, "
                 "bukan probabilitas kemenangan._"
             ),
@@ -1529,7 +2416,18 @@ def generate_signal_message(analysis: dict) -> str:
         ]
     )
 
-    return "\n".join(lines)
+    message = "\n".join(lines)
+
+    # Batas Telegram 4096 karakter. Pertahankan bagian terpenting jika terlalu panjang.
+    if len(message) > 4000:
+        compact_lines = [
+            line
+            for line in lines
+            if not line.startswith("• Pola candle: tidak ada")
+        ]
+        message = "\n".join(compact_lines)
+
+    return message[:4096]
 
 
 # =============================================================================
