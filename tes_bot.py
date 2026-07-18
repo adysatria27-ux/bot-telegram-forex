@@ -2,6 +2,7 @@ import os
 import math
 import time
 import logging
+import asyncio
 
 from telegram import (
     Update,
@@ -21,10 +22,20 @@ from telegram.ext import (
 from xauusd_analysis import (
     get_market_data as get_multi_timeframe_market_data,
     generate_signal_message as generate_multi_timeframe_signal_message,
+    get_market_candles,
     get_supported_assets,
     get_asset_config,
     resolve_symbol_from_menu_text,
     resolve_symbol_from_callback,
+)
+
+from signal_tracker import (
+    initialize_database,
+    record_analysis,
+    update_open_signals,
+    get_open_symbols,
+    get_recent_signals,
+    get_performance_summary,
 )
 
 
@@ -42,6 +53,11 @@ API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
 USER_ANALYSIS_COOLDOWN_SECONDS = 15
 MENU_COLUMNS = 2
+
+TRACKER_INTERVAL = "5min"
+TRACKER_STATS_DAYS = 30
+TRACKER_RECENT_LIMIT = 10
+MAX_TRACKER_REFRESH_SYMBOLS = 8
 
 
 # =============================================================================
@@ -119,6 +135,222 @@ async def handle_message(
         reply_markup=keyboard,
     )
 
+
+
+# =============================================================================
+# 4. SIGNAL LOGGER DAN OUTCOME TRACKER
+# =============================================================================
+async def _refresh_tracker_symbol(symbol: str) -> dict[str, int]:
+    """
+    Memperbarui signal lama dengan candle terbaru.
+
+    Fungsi get_market_candles() memakai cache engine yang sama, sehingga
+    pemanggilan setelah analisis biasanya tidak menambah request API.
+    """
+    candles = await get_market_candles(
+        symbol,
+        TRACKER_INTERVAL,
+    )
+    return await asyncio.to_thread(
+        update_open_signals,
+        symbol,
+        candles,
+    )
+
+
+async def _track_analysis(
+    symbol: str,
+    analysis: dict,
+) -> None:
+    """
+    Memperbarui outcome lama lalu mencatat analisis baru.
+
+    Kegagalan tracker tidak boleh menggagalkan pesan analisis Telegram.
+    """
+    try:
+        tracker_update = await _refresh_tracker_symbol(symbol)
+        log_result = await asyncio.to_thread(
+            record_analysis,
+            analysis,
+        )
+
+        logger.info(
+            "Signal tracker selesai | symbol=%s | analysis_id=%s | "
+            "inserted=%s | checked=%s | closed=%s",
+            symbol,
+            log_result.get("id"),
+            log_result.get("inserted"),
+            tracker_update.get("checked", 0),
+            tracker_update.get("closed", 0),
+        )
+    except Exception:
+        logger.exception(
+            "Signal tracker gagal, analisis Telegram tetap dilanjutkan | "
+            "symbol=%s",
+            symbol,
+        )
+
+
+async def _refresh_all_open_signals() -> None:
+    """Memperbarui outcome beberapa symbol OPEN secara hemat API."""
+    symbols = await asyncio.to_thread(get_open_symbols)
+
+    for symbol in symbols[:MAX_TRACKER_REFRESH_SYMBOLS]:
+        try:
+            await _refresh_tracker_symbol(symbol)
+        except Exception:
+            logger.exception(
+                "Gagal refresh outcome | symbol=%s",
+                symbol,
+            )
+
+
+def _format_recent_signals(
+    rows: list[dict],
+) -> str:
+    """Membuat daftar signal terbaru dalam teks Telegram."""
+    if not rows:
+        return (
+            "📭 Belum ada histori analisis.\n"
+            "Jalankan analisis aset terlebih dahulu."
+        )
+
+    lines = ["📋 Histori Signal Terbaru", ""]
+
+    for row in rows:
+        signal = row.get("signal", "HOLD")
+        symbol = row.get("symbol", "-")
+        confidence = float(row.get("confidence") or 0.0)
+        outcome = row.get("outcome", "-")
+        max_tp_hit = int(row.get("max_tp_hit") or 0)
+
+        if signal == "BUY":
+            icon = "🟢"
+        elif signal == "SELL":
+            icon = "🔴"
+        else:
+            icon = "🟡"
+
+        tp_text = (
+            f" | TP max: {max_tp_hit}"
+            if max_tp_hit > 0
+            else ""
+        )
+        lines.append(
+            f"{icon} #{row.get('id')} {symbol} {signal} "
+            f"| Conf {confidence:.1f}% | {outcome}{tp_text}"
+        )
+
+    return "\n".join(lines)
+
+
+def _format_tracker_stats(
+    summary: dict,
+) -> str:
+    """Membuat statistik outcome tracker."""
+    completed = int(summary.get("completed_trades") or 0)
+    open_trades = int(summary.get("open_trades") or 0)
+    trade_signals = int(summary.get("trade_signals") or 0)
+    holds = int(summary.get("holds") or 0)
+    tp1_or_better = int(summary.get("tp1_or_better") or 0)
+    tp2_or_better = int(summary.get("tp2_or_better") or 0)
+    tp3_hits = int(summary.get("tp3_hits") or 0)
+    direct_sl = int(summary.get("direct_sl") or 0)
+    sl_after_tp = int(summary.get("sl_after_tp") or 0)
+    expired = int(summary.get("expired") or 0)
+    average_confidence = float(
+        summary.get("average_trade_confidence") or 0.0
+    )
+
+    lines = [
+        f"📈 Statistik Signal — {summary.get('days', 30)} Hari",
+        "",
+        f"Total analisis: {int(summary.get('total_analyses') or 0)}",
+        f"HOLD: {holds}",
+        f"BUY/SELL: {trade_signals}",
+        f"Masih OPEN: {open_trades}",
+        f"Selesai: {completed}",
+        "",
+        f"TP1 atau lebih: {tp1_or_better}",
+        f"TP2 atau lebih: {tp2_or_better}",
+        f"TP3: {tp3_hits}",
+        f"SL langsung: {direct_sl}",
+        f"SL setelah TP: {sl_after_tp}",
+        f"Expired: {expired}",
+        f"TP1 hit rate: {float(summary.get('tp1_hit_rate_pct') or 0.0):.1f}%",
+        f"Rata-rata confidence trade: {average_confidence:.1f}%",
+    ]
+
+    buckets = summary.get("confidence_buckets") or []
+    if buckets:
+        lines.extend(["", "Confidence Buckets:"])
+        for bucket in buckets:
+            signals = int(bucket.get("signals") or 0)
+            wins = int(bucket.get("tp1_or_better") or 0)
+            rate = (wins / signals * 100) if signals else 0.0
+            lines.append(
+                f"• {bucket.get('bucket')}: {wins}/{signals} "
+                f"mencapai TP1+ ({rate:.1f}%)"
+            )
+
+    lines.extend(
+        [
+            "",
+            "Catatan: TP dan SL pada candle yang sama dihitung SL dahulu.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+async def signals_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Perintah /signals untuk melihat histori terbaru."""
+    if update.message is None:
+        return
+
+    try:
+        rows = await asyncio.to_thread(
+            get_recent_signals,
+            TRACKER_RECENT_LIMIT,
+        )
+        await update.message.reply_text(
+            _format_recent_signals(rows)
+        )
+    except Exception:
+        logger.exception("Gagal membaca histori signal.")
+        await update.message.reply_text(
+            "❌ Gagal membaca histori signal."
+        )
+
+
+async def stats_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Perintah /stats untuk memperbarui dan menampilkan statistik."""
+    if update.message is None:
+        return
+
+    try:
+        await update.message.reply_text(
+            "⏳ Memperbarui outcome signal yang masih aktif..."
+        )
+        await _refresh_all_open_signals()
+
+        summary = await asyncio.to_thread(
+            get_performance_summary,
+            TRACKER_STATS_DAYS,
+        )
+        await update.message.reply_text(
+            _format_tracker_stats(summary)
+        )
+    except Exception:
+        logger.exception("Gagal membuat statistik signal.")
+        await update.message.reply_text(
+            "❌ Gagal membuat statistik signal."
+        )
 
 # =============================================================================
 # 5. HANDLER ANALISIS GENERIC
@@ -204,6 +436,7 @@ async def button(
 
     try:
         analysis = await get_market_data(symbol)
+        await _track_analysis(symbol, analysis)
         message = generate_signal_message(analysis)
 
         logger.info(
@@ -286,9 +519,17 @@ if __name__ == "__main__":
             "Bot dapat berjalan, tetapi analisis pasar akan gagal."
         )
 
+    database_path = initialize_database()
+    logger.info(
+        "Signal tracker aktif | database=%s",
+        database_path,
+    )
+
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("signals", signals_command))
+    app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
