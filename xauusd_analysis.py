@@ -1,14 +1,14 @@
 """
 ================================================================================
-Modul Analisis Teknikal Multi-Timeframe untuk Bot Telegram Forex
+Generic Multi-Asset Market Analysis Engine untuk Bot Telegram
 ================================================================================
 
 Sumber data:
     Twelve Data
 
 Tujuan:
-    Menghasilkan analisis BUY, SELL, atau HOLD menggunakan konfluensi
-    beberapa timeframe dan indikator teknikal.
+    Menghasilkan analisis BUY, SELL, atau HOLD untuk forex, logam,
+    crypto, dan indeks menggunakan satu pipeline analisis yang sama.
 
 Indikator saat ini:
     - RSI 14
@@ -105,6 +105,175 @@ OHLC_CACHE_TTL_SECONDS = {
     "1h": 300,
 }
 MAX_CONCURRENT_API_REQUESTS = 4
+MAX_OHLC_CACHE_ENTRIES = 128
+MAX_ANALYSIS_CACHE_ENTRIES = 32
+
+
+@dataclass(frozen=True)
+class AssetConfig:
+    """Konfigurasi satu aset tanpa menduplikasi pipeline analisis."""
+
+    symbol: str
+    provider_symbols: tuple[str, ...]
+    asset_class: str
+    decimals: int
+    callback_data: str
+    menu_label: str
+    analysis_cache_ttl_seconds: int = ANALYSIS_CACHE_TTL_SECONDS
+    aliases: tuple[str, ...] = ()
+    legacy_menu_texts: tuple[str, ...] = ()
+
+
+SUPPORTED_ASSETS: tuple[AssetConfig, ...] = (
+    AssetConfig(
+        symbol="XAU/USD",
+        provider_symbols=("XAU/USD",),
+        asset_class="metal",
+        decimals=2,
+        callback_data="analyze_xauusd",
+        menu_label="XAU/USD",
+        aliases=("XAUUSD", "GOLD"),
+        legacy_menu_texts=("Cek Harga XAUUSD",),
+    ),
+    AssetConfig(
+        symbol="XAG/USD",
+        provider_symbols=("XAG/USD",),
+        asset_class="metal",
+        decimals=3,
+        callback_data="analyze_xagusd",
+        menu_label="XAG/USD",
+        aliases=("XAGUSD", "SILVER"),
+    ),
+    AssetConfig(
+        symbol="EUR/USD",
+        provider_symbols=("EUR/USD",),
+        asset_class="forex",
+        decimals=5,
+        callback_data="analyze_eurusd",
+        menu_label="EUR/USD",
+        aliases=("EURUSD",),
+        legacy_menu_texts=("Cek Harga EURUSD",),
+    ),
+    AssetConfig(
+        symbol="GBP/USD",
+        provider_symbols=("GBP/USD",),
+        asset_class="forex",
+        decimals=5,
+        callback_data="analyze_gbpusd",
+        menu_label="GBP/USD",
+        aliases=("GBPUSD",),
+    ),
+    AssetConfig(
+        symbol="USD/JPY",
+        provider_symbols=("USD/JPY",),
+        asset_class="forex",
+        decimals=3,
+        callback_data="analyze_usdjpy",
+        menu_label="USD/JPY",
+        aliases=("USDJPY",),
+    ),
+    AssetConfig(
+        symbol="AUD/USD",
+        provider_symbols=("AUD/USD",),
+        asset_class="forex",
+        decimals=5,
+        callback_data="analyze_audusd",
+        menu_label="AUD/USD",
+        aliases=("AUDUSD",),
+    ),
+    AssetConfig(
+        symbol="NZD/USD",
+        provider_symbols=("NZD/USD",),
+        asset_class="forex",
+        decimals=5,
+        callback_data="analyze_nzdusd",
+        menu_label="NZD/USD",
+        aliases=("NZDUSD",),
+    ),
+    AssetConfig(
+        symbol="USD/CAD",
+        provider_symbols=("USD/CAD",),
+        asset_class="forex",
+        decimals=5,
+        callback_data="analyze_usdcad",
+        menu_label="USD/CAD",
+        aliases=("USDCAD",),
+    ),
+    AssetConfig(
+        symbol="USD/CHF",
+        provider_symbols=("USD/CHF",),
+        asset_class="forex",
+        decimals=5,
+        callback_data="analyze_usdchf",
+        menu_label="USD/CHF",
+        aliases=("USDCHF",),
+    ),
+    AssetConfig(
+        symbol="BTC/USD",
+        provider_symbols=("BTC/USD",),
+        asset_class="crypto",
+        decimals=2,
+        callback_data="analyze_btcusd",
+        menu_label="BTC/USD",
+        analysis_cache_ttl_seconds=20,
+        aliases=("BTCUSD", "BITCOIN"),
+    ),
+    AssetConfig(
+        symbol="ETH/USD",
+        provider_symbols=("ETH/USD",),
+        asset_class="crypto",
+        decimals=2,
+        callback_data="analyze_ethusd",
+        menu_label="ETH/USD",
+        analysis_cache_ttl_seconds=20,
+        aliases=("ETHUSD", "ETHEREUM"),
+    ),
+    AssetConfig(
+        symbol="NAS100",
+        provider_symbols=("NDX", "NAS100"),
+        asset_class="index",
+        decimals=2,
+        callback_data="analyze_nas100",
+        menu_label="NAS100",
+        aliases=("NDX", "NASDAQ100", "NASDAQ 100"),
+    ),
+    AssetConfig(
+        symbol="US30",
+        provider_symbols=("DJI", "DJIA", "US30"),
+        asset_class="index",
+        decimals=2,
+        callback_data="analyze_us30",
+        menu_label="US30",
+        aliases=("DJI", "DJIA", "DOW", "DOW30"),
+    ),
+)
+
+
+def _asset_key(value: str) -> str:
+    """Membuat key pembanding yang toleran terhadap slash dan spasi."""
+    return "".join(character for character in value.upper() if character.isalnum())
+
+
+_ASSET_BY_SYMBOL: dict[str, AssetConfig] = {
+    asset.symbol: asset for asset in SUPPORTED_ASSETS
+}
+_ASSET_ALIAS_LOOKUP: dict[str, str] = {}
+_MENU_TEXT_LOOKUP: dict[str, str] = {}
+_CALLBACK_SYMBOL_LOOKUP: dict[str, str] = {}
+
+for _asset in SUPPORTED_ASSETS:
+    for _alias in (_asset.symbol, _asset.menu_label, *_asset.aliases):
+        _ASSET_ALIAS_LOOKUP[_asset_key(_alias)] = _asset.symbol
+
+    _MENU_TEXT_LOOKUP[_asset.menu_label.casefold()] = _asset.symbol
+    for _legacy_text in _asset.legacy_menu_texts:
+        _MENU_TEXT_LOOKUP[_legacy_text.casefold()] = _asset.symbol
+
+    if _asset.callback_data in _CALLBACK_SYMBOL_LOOKUP:
+        raise RuntimeError(
+            f"Callback Telegram duplikat: {_asset.callback_data}"
+        )
+    _CALLBACK_SYMBOL_LOOKUP[_asset.callback_data] = _asset.symbol
 
 
 # =============================================================================
@@ -218,16 +387,80 @@ class CacheEntry:
 _OHLC_CACHE: dict[tuple[str, str], CacheEntry] = {}
 _ANALYSIS_CACHE: dict[str, CacheEntry] = {}
 _ANALYSIS_LOCKS: dict[str, asyncio.Lock] = {}
+_PROVIDER_SYMBOL_CACHE: dict[str, str] = {}
 _API_SEMAPHORE: Optional[asyncio.Semaphore] = None
 
 
 def _normalize_symbol(symbol: str) -> str:
-    """Menormalkan symbol agar key cache konsisten."""
+    """Mengubah alias pengguna menjadi symbol canonical yang didukung."""
+    if not isinstance(symbol, str):
+        raise ValueError("Symbol harus berupa teks.")
+
+    cleaned = symbol.strip()
+    if not cleaned:
+        raise ValueError("Symbol tidak boleh kosong.")
+
+    canonical = _ASSET_ALIAS_LOOKUP.get(_asset_key(cleaned))
+    if canonical is None:
+        supported = ", ".join(asset.symbol for asset in SUPPORTED_ASSETS)
+        raise ValueError(
+            f"Symbol '{cleaned}' belum didukung. Pilihan: {supported}."
+        )
+    return canonical
+
+
+def _normalize_provider_symbol(symbol: str) -> str:
+    """Menormalkan ticker yang dikirim langsung ke data provider."""
     normalized = symbol.strip().upper()
     if not normalized:
-        raise ValueError("Symbol tidak boleh kosong.")
+        raise ValueError("Provider symbol tidak boleh kosong.")
     return normalized
 
+
+def get_asset_config(symbol: str) -> AssetConfig:
+    """Mengambil konfigurasi aset menggunakan canonical symbol atau alias."""
+    return _ASSET_BY_SYMBOL[_normalize_symbol(symbol)]
+
+
+def get_supported_assets() -> tuple[AssetConfig, ...]:
+    """Daftar aset terurut untuk menu dan integrasi eksternal."""
+    return SUPPORTED_ASSETS
+
+
+def get_supported_symbols() -> tuple[str, ...]:
+    """Daftar canonical symbol yang diterima get_market_data()."""
+    return tuple(asset.symbol for asset in SUPPORTED_ASSETS)
+
+
+def resolve_symbol_from_menu_text(text: str) -> Optional[str]:
+    """Menerjemahkan teks Reply Keyboard, termasuk menu versi lama."""
+    if not isinstance(text, str):
+        return None
+
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+
+    direct_match = _MENU_TEXT_LOOKUP.get(cleaned.casefold())
+    if direct_match is not None:
+        return direct_match
+
+    try:
+        return _normalize_symbol(cleaned)
+    except ValueError:
+        return None
+
+
+def resolve_symbol_from_callback(callback_data: str) -> Optional[str]:
+    """Menerjemahkan callback Telegram menjadi canonical symbol."""
+    if not isinstance(callback_data, str):
+        return None
+    return _CALLBACK_SYMBOL_LOOKUP.get(callback_data)
+
+
+def get_callback_data(symbol: str) -> str:
+    """Mengambil callback Telegram untuk symbol yang didukung."""
+    return get_asset_config(symbol).callback_data
 
 def _get_analysis_lock(symbol: str) -> asyncio.Lock:
     """Mengambil lock per symbol untuk mencegah request identik ganda."""
@@ -264,6 +497,28 @@ def _get_valid_cache_entry(
     return entry
 
 
+def _prune_cache(
+    cache: dict[Any, CacheEntry],
+    max_entries: int,
+) -> None:
+    """Menghapus entry kedaluwarsa dan membatasi pertumbuhan memory."""
+    now = time.monotonic()
+    for key, entry in list(cache.items()):
+        if now >= entry.expires_at:
+            cache.pop(key, None)
+
+    overflow = len(cache) - max_entries
+    if overflow <= 0:
+        return
+
+    oldest_keys = sorted(
+        cache,
+        key=lambda key: cache[key].created_at,
+    )[:overflow]
+    for key in oldest_keys:
+        cache.pop(key, None)
+
+
 def _get_cached_ohlc(
     symbol: str,
     interval: str,
@@ -293,6 +548,7 @@ def _set_cached_ohlc(
         created_at=now,
         expires_at=now + ttl,
     )
+    _prune_cache(_OHLC_CACHE, MAX_OHLC_CACHE_ENTRIES)
 
 
 def _get_cached_analysis(symbol: str) -> Optional[dict]:
@@ -311,38 +567,41 @@ def _get_cached_analysis(symbol: str) -> Optional[dict]:
 
 
 def _set_cached_analysis(symbol: str, analysis: dict) -> None:
-    """Menyimpan hasil analisis lengkap ke cache."""
+    """Menyimpan hasil analisis lengkap dengan TTL per jenis aset."""
+    canonical_symbol = _normalize_symbol(symbol)
+    asset = _ASSET_BY_SYMBOL[canonical_symbol]
     now = time.monotonic()
     cached_value = copy.deepcopy(analysis)
     cached_value["cache_hit"] = False
     cached_value["cache_age_seconds"] = 0.0
 
-    _ANALYSIS_CACHE[symbol] = CacheEntry(
+    _ANALYSIS_CACHE[canonical_symbol] = CacheEntry(
         value=cached_value,
         created_at=now,
-        expires_at=now + ANALYSIS_CACHE_TTL_SECONDS,
+        expires_at=now + asset.analysis_cache_ttl_seconds,
     )
-
+    _prune_cache(_ANALYSIS_CACHE, MAX_ANALYSIS_CACHE_ENTRIES)
 
 def clear_caches(symbol: Optional[str] = None) -> None:
-    """
-    Menghapus cache secara manual.
-
-    symbol=None menghapus seluruh cache. Fungsi ini berguna untuk test,
-    maintenance, atau saat konfigurasi strategi berubah.
-    """
+    """Menghapus cache seluruh aset atau satu canonical symbol."""
     if symbol is None:
         _OHLC_CACHE.clear()
         _ANALYSIS_CACHE.clear()
+        _PROVIDER_SYMBOL_CACHE.clear()
         return
 
-    normalized_symbol = _normalize_symbol(symbol)
-    _ANALYSIS_CACHE.pop(normalized_symbol, None)
+    canonical_symbol = _normalize_symbol(symbol)
+    asset = _ASSET_BY_SYMBOL[canonical_symbol]
+    _ANALYSIS_CACHE.pop(canonical_symbol, None)
+    _PROVIDER_SYMBOL_CACHE.pop(canonical_symbol, None)
 
+    provider_keys = {
+        _normalize_provider_symbol(provider)
+        for provider in asset.provider_symbols
+    }
     for key in list(_OHLC_CACHE):
-        if key[0] == normalized_symbol:
+        if key[0] in provider_keys:
             _OHLC_CACHE.pop(key, None)
-
 
 # =============================================================================
 # 3. HELPER VALIDASI DAN FORMAT
@@ -363,13 +622,8 @@ def _safe_float(value: Any, field_name: str) -> float:
 
 
 def _decimal_places(symbol: str) -> int:
-    """
-    Menentukan jumlah desimal untuk format pesan.
-    """
-    if symbol == "XAU/USD":
-        return 2
-    return 5
-
+    """Jumlah desimal berdasarkan konfigurasi aset."""
+    return get_asset_config(symbol).decimals
 
 def _timeframe_bias(score: float) -> str:
     """
@@ -396,7 +650,7 @@ async def _fetch_ohlc(
     Data cache digunakan terlebih dahulu. Jika cache tidak tersedia atau sudah
     kedaluwarsa, fungsi mengambil data dari Twelve Data dan menyimpannya kembali.
     """
-    normalized_symbol = _normalize_symbol(symbol)
+    normalized_symbol = _normalize_provider_symbol(symbol)
 
     cached_dataframe = _get_cached_ohlc(
         normalized_symbol,
@@ -598,6 +852,44 @@ async def _fetch_ohlc(
             await asyncio.sleep(RETRY_BACKOFF_SECONDS * attempt)
 
     return None
+
+
+async def _resolve_provider_symbol(asset: AssetConfig) -> str:
+    """
+    Menentukan ticker provider sekali per process.
+
+    Probe menggunakan timeframe 15 menit. Data probe otomatis masuk OHLC cache,
+    sehingga total request pertama tetap maksimal empat ketika kandidat pertama
+    valid. Fallback terutama disediakan untuk alias indeks.
+    """
+    cached_provider = _PROVIDER_SYMBOL_CACHE.get(asset.symbol)
+    if cached_provider is not None:
+        return cached_provider
+
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for provider_symbol in asset.provider_symbols:
+            normalized_provider = _normalize_provider_symbol(provider_symbol)
+            probe = await _fetch_ohlc(
+                session,
+                normalized_provider,
+                ENTRY_TIMEFRAME_FOR_ATR,
+            )
+            if probe is not None and not probe.empty:
+                _PROVIDER_SYMBOL_CACHE[asset.symbol] = normalized_provider
+                logger.info(
+                    "Provider symbol resolved | symbol=%s | provider=%s",
+                    asset.symbol,
+                    normalized_provider,
+                )
+                return normalized_provider
+
+    candidates = ", ".join(asset.provider_symbols)
+    raise RuntimeError(
+        f"Data {asset.symbol} tidak tersedia dari Twelve Data "
+        f"menggunakan ticker: {candidates}. Untuk indeks, periksa juga "
+        "dukungan paket Twelve Data yang digunakan."
+    )
 
 
 # =============================================================================
@@ -1894,6 +2186,136 @@ def _build_reasons(
     return reasons[:6]
 
 
+def _calculate_risk_reward(
+    entry: Optional[float],
+    stop_loss: Optional[float],
+    target: Optional[float],
+) -> Optional[float]:
+    """Menghitung reward terhadap satu unit risk."""
+    if entry is None or stop_loss is None or target is None:
+        return None
+
+    risk_distance = abs(entry - stop_loss)
+    if risk_distance <= np.finfo(float).eps:
+        return None
+
+    reward_distance = abs(target - entry)
+    return round(reward_distance / risk_distance, 2)
+
+
+def _build_indicator_checklist(
+    candidate_signal: str,
+    signal: str,
+    trend: str,
+    confidence_pct: float,
+    coverage_ratio: float,
+    directional_agreement: float,
+    structure_confirmation: float,
+    pattern_confirmation: float,
+    sideways_ratio: float,
+    false_breakout_filter_passed: bool,
+    timeframe_results: dict[str, TimeframeResult],
+    reference_result: TimeframeResult,
+) -> list[dict[str, str]]:
+    """Membuat checklist indikator yang stabil untuk API dan Telegram."""
+    checklist: list[dict[str, str]] = []
+
+    def add(name: str, status: str, detail: str) -> None:
+        checklist.append(
+            {"name": name, "status": status, "detail": detail}
+        )
+
+    if coverage_ratio >= 0.90:
+        add("Data multi-timeframe", "PASS", f"Coverage {coverage_ratio * 100:.0f}%")
+    elif coverage_ratio >= MIN_COVERAGE_RATIO:
+        add("Data multi-timeframe", "WARN", f"Coverage {coverage_ratio * 100:.0f}%")
+    else:
+        add("Data multi-timeframe", "FAIL", f"Coverage {coverage_ratio * 100:.0f}%")
+
+    target_trend = "Bullish" if candidate_signal == "BUY" else "Bearish"
+    if candidate_signal == "HOLD" or trend == "Sideways":
+        add("Trend timeframe besar", "WARN", trend)
+    elif trend == target_trend:
+        add("Trend timeframe besar", "PASS", trend)
+    else:
+        add("Trend timeframe besar", "FAIL", trend)
+
+    if directional_agreement >= 0.75:
+        add("Keselarasan timeframe", "PASS", f"{directional_agreement * 100:.0f}%")
+    elif directional_agreement >= MIN_DIRECTIONAL_AGREEMENT:
+        add("Keselarasan timeframe", "WARN", f"{directional_agreement * 100:.0f}%")
+    else:
+        add("Keselarasan timeframe", "FAIL", f"{directional_agreement * 100:.0f}%")
+
+    if confidence_pct >= 75:
+        add("Confidence", "PASS", f"{confidence_pct:.1f}%")
+    elif confidence_pct >= MIN_CONFIDENCE_FOR_SIGNAL:
+        add("Confidence", "WARN", f"{confidence_pct:.1f}%")
+    else:
+        add("Confidence", "FAIL", f"{confidence_pct:.1f}%")
+
+    if structure_confirmation >= 0.45:
+        add("Market structure", "PASS", f"{structure_confirmation * 100:.0f}%")
+    elif structure_confirmation >= MIN_STRUCTURE_CONFIRMATION:
+        add("Market structure", "WARN", f"{structure_confirmation * 100:.0f}%")
+    else:
+        add("Market structure", "FAIL", reference_result.market_structure)
+
+    target_direction = "BULLISH" if candidate_signal == "BUY" else "BEARISH"
+    structure_events = [
+        event
+        for result in timeframe_results.values()
+        for event in (result.choch, result.bos)
+        if event is not None
+    ]
+    if candidate_signal in {"BUY", "SELL"} and target_direction in structure_events:
+        add("BOS / CHoCH", "PASS", f"Konfirmasi {target_direction.title()}")
+    elif structure_events:
+        add("BOS / CHoCH", "FAIL", "Event berlawanan atau belum selaras")
+    else:
+        add("BOS / CHoCH", "WARN", "Belum ada break valid")
+
+    if candidate_signal == "BUY" and reference_result.support_level is not None:
+        distance = abs(reference_result.close - reference_result.support_level)
+        status = "PASS" if distance <= reference_result.atr * NEAR_LEVEL_ATR_MULTIPLIER else "WARN"
+        add("Support / Resistance", status, "Support tersedia")
+    elif candidate_signal == "SELL" and reference_result.resistance_level is not None:
+        distance = abs(reference_result.resistance_level - reference_result.close)
+        status = "PASS" if distance <= reference_result.atr * NEAR_LEVEL_ATR_MULTIPLIER else "WARN"
+        add("Support / Resistance", status, "Resistance tersedia")
+    else:
+        add("Support / Resistance", "WARN", "Belum menjadi konfirmasi utama")
+
+    if pattern_confirmation >= 0.35:
+        add("Candlestick pattern", "PASS", f"{pattern_confirmation * 100:.0f}%")
+    elif pattern_confirmation > 0:
+        add("Candlestick pattern", "WARN", f"{pattern_confirmation * 100:.0f}%")
+    elif reference_result.candlestick_patterns:
+        add("Candlestick pattern", "WARN", ", ".join(reference_result.candlestick_patterns[:2]))
+    else:
+        add("Candlestick pattern", "WARN", "Tidak ada pola kuat")
+
+    if sideways_ratio <= 0.25:
+        add("Sideways filter", "PASS", f"{sideways_ratio * 100:.0f}% sideways")
+    elif sideways_ratio <= MAX_SIDEWAYS_RATIO_FOR_SIGNAL:
+        add("Sideways filter", "WARN", f"{sideways_ratio * 100:.0f}% sideways")
+    else:
+        add("Sideways filter", "FAIL", f"{sideways_ratio * 100:.0f}% sideways")
+
+    add(
+        "False breakout filter",
+        "PASS" if false_breakout_filter_passed else "FAIL",
+        "Lolos" if false_breakout_filter_passed else "Terdeteksi risiko false breakout",
+    )
+
+    if signal in {"BUY", "SELL"}:
+        add("Keputusan final", "PASS", signal)
+    else:
+        add("Keputusan final", "WARN", "HOLD — tunggu konfirmasi")
+
+    return checklist
+
+
 # =============================================================================
 # 8. FUNGSI UTAMA ANALISIS
 # =============================================================================
@@ -2108,6 +2530,40 @@ async def _build_market_analysis(
         take_profit_2 = entry_price - (ATR_TP2_MULTIPLIER * atr_value)
         take_profit_3 = entry_price - (ATR_TP3_MULTIPLIER * atr_value)
 
+    risk_reward_tp1 = _calculate_risk_reward(
+        entry_price if signal in {"BUY", "SELL"} else None,
+        stop_loss,
+        take_profit_1,
+    )
+    risk_reward_tp2 = _calculate_risk_reward(
+        entry_price if signal in {"BUY", "SELL"} else None,
+        stop_loss,
+        take_profit_2,
+    )
+    risk_reward_tp3 = _calculate_risk_reward(
+        entry_price if signal in {"BUY", "SELL"} else None,
+        stop_loss,
+        take_profit_3,
+    )
+
+    indicator_checklist = _build_indicator_checklist(
+        candidate_signal=candidate_signal,
+        signal=signal,
+        trend=trend,
+        confidence_pct=confidence_pct,
+        coverage_ratio=coverage_ratio,
+        directional_agreement=directional_agreement,
+        structure_confirmation=structure_confirmation,
+        pattern_confirmation=pattern_confirmation,
+        sideways_ratio=sideways_ratio,
+        false_breakout_filter_passed=(
+            false_breakout_filter_passed
+            and not higher_timeframe_false_breakout
+        ),
+        timeframe_results=timeframe_results,
+        reference_result=reference_result,
+    )
+
     missing_timeframes = [
         timeframe
         for timeframe in TIMEFRAMES
@@ -2170,6 +2626,7 @@ async def _build_market_analysis(
         "risk": risk,
         "reasons": reasons,
         "entry_price": entry_price,
+        "entry": entry_price if signal in {"BUY", "SELL"} else None,
         "atr_reference_tf": reference_timeframe,
         "atr_value": atr_value,
         "sl": stop_loss,
@@ -2177,6 +2634,16 @@ async def _build_market_analysis(
         "tp1": take_profit_1,
         "tp2": take_profit_2,
         "tp3": take_profit_3,
+        "risk_reward": {
+            "tp1": risk_reward_tp1,
+            "tp2": risk_reward_tp2,
+            "tp3": risk_reward_tp3,
+        },
+        "risk_reward_tp1": risk_reward_tp1,
+        "risk_reward_tp2": risk_reward_tp2,
+        "risk_reward_tp3": risk_reward_tp3,
+        "rr": risk_reward_tp2,
+        "indicator_checklist": indicator_checklist,
         "missing_timeframes": missing_timeframes,
         "available_timeframes": list(timeframe_results.keys()),
         "latest_data_times": latest_data_times,
@@ -2218,57 +2685,69 @@ async def get_market_data(
     symbol: str = DEFAULT_SYMBOL,
 ) -> dict:
     """
-    Mengambil hasil analisis multi-timeframe dengan cache dan request coalescing.
+    Generic public API untuk seluruh aset yang didukung.
 
-    Permintaan identik untuk symbol yang sama tidak akan menjalankan analisis
-    bersamaan. Hasil cache dikembalikan sebagai salinan agar pemanggil tidak
-    dapat mengubah data yang tersimpan.
+    Contoh:
+        await get_market_data("XAU/USD")
+        await get_market_data("EURUSD")
+        await get_market_data("NAS100")
+
+    Hasil cache dikembalikan sebagai deep copy untuk mencegah mutasi silang.
     """
-    normalized_symbol = _normalize_symbol(symbol)
+    canonical_symbol = _normalize_symbol(symbol)
+    asset = _ASSET_BY_SYMBOL[canonical_symbol]
 
-    cached_analysis = _get_cached_analysis(normalized_symbol)
+    cached_analysis = _get_cached_analysis(canonical_symbol)
     if cached_analysis is not None:
         logger.info(
             "Analysis cache hit | symbol=%s | age=%.1fs",
-            normalized_symbol,
+            canonical_symbol,
             cached_analysis.get("cache_age_seconds", 0.0),
         )
+        cached_analysis["requested_symbol"] = symbol
         return cached_analysis
 
-    analysis_lock = _get_analysis_lock(normalized_symbol)
+    analysis_lock = _get_analysis_lock(canonical_symbol)
 
     async with analysis_lock:
-        cached_analysis = _get_cached_analysis(normalized_symbol)
+        cached_analysis = _get_cached_analysis(canonical_symbol)
         if cached_analysis is not None:
             logger.info(
                 "Analysis cache hit after lock | symbol=%s | age=%.1fs",
-                normalized_symbol,
+                canonical_symbol,
                 cached_analysis.get("cache_age_seconds", 0.0),
             )
+            cached_analysis["requested_symbol"] = symbol
             return cached_analysis
 
-        analysis = await _build_market_analysis(normalized_symbol)
+        provider_symbol = await _resolve_provider_symbol(asset)
+        analysis = await _build_market_analysis(provider_symbol)
+
+        analysis["symbol"] = canonical_symbol
+        analysis["provider_symbol"] = provider_symbol
+        analysis["asset_class"] = asset.asset_class
+        analysis["decimal_places"] = asset.decimals
+        analysis["requested_symbol"] = symbol
         analysis["cache_hit"] = False
         analysis["cache_age_seconds"] = 0.0
         analysis["analysis_cache_ttl_seconds"] = (
-            ANALYSIS_CACHE_TTL_SECONDS
+            asset.analysis_cache_ttl_seconds
         )
 
-        _set_cached_analysis(normalized_symbol, analysis)
-
+        _set_cached_analysis(canonical_symbol, analysis)
         return copy.deepcopy(analysis)
-
 
 # =============================================================================
 # 9. FORMAT PESAN TELEGRAM
 # =============================================================================
 def generate_signal_message(analysis: dict) -> str:
-    """Mengubah hasil analisis menjadi pesan Markdown Telegram."""
+    """Mengubah hasil generic engine menjadi Markdown Telegram kompatibel."""
     symbol = analysis["symbol"]
     signal = analysis.get("signal", analysis.get("direction", "HOLD"))
-    confidence = analysis["confidence_pct"]
+    confidence = float(analysis.get("confidence_pct", 0.0))
     trend = analysis.get("trend", "Sideways")
     risk = analysis.get("risk", "Tinggi")
+    decimals = _decimal_places(symbol)
 
     emoji = {
         "BUY": "🟢",
@@ -2277,29 +2756,35 @@ def generate_signal_message(analysis: dict) -> str:
         "NEUTRAL": "🟡",
     }.get(signal, "⚪")
 
-    decimals = _decimal_places(symbol)
-
     lines = [
         f"*📊 Analisis Multi-Timeframe — {symbol}*",
         "",
         f"{emoji} *Signal: {signal}*",
-        f"*Confidence Score: {confidence:.1f}%*",
+        f"*Confidence: {confidence:.1f}%*",
         f"*Trend: {trend}*",
-        f"*Risk Sinyal: {risk}*",
+        f"*Risk: {risk}*",
         "",
-        "*Alasan Analisis:*",
+        "*Reasons / Alasan Analisis:*",
     ]
 
     reasons = analysis.get("reasons") or [
         "Belum ada alasan analisis yang tersedia."
     ]
-    for reason in reasons:
+    for reason in reasons[:6]:
         lines.append(f"• {reason}")
 
-    lines.extend(["", "*Detail per Timeframe:*"])
+    lines.extend(["", "*Indicator Checklist / Checklist Indikator:*"])
+    status_emoji = {"PASS": "✅", "WARN": "⚠️", "FAIL": "❌"}
+    for item in analysis.get("indicator_checklist", [])[:10]:
+        status = str(item.get("status", "WARN")).upper()
+        icon = status_emoji.get(status, "⚠️")
+        name = item.get("name", "Indikator")
+        detail = item.get("detail", "")
+        lines.append(f"{icon} {name}: {detail}")
 
+    lines.extend(["", "*Detail per Timeframe:*"])
     for timeframe in TIMEFRAMES:
-        result = analysis["timeframes"].get(timeframe)
+        result = analysis.get("timeframes", {}).get(timeframe)
         label = TIMEFRAME_LABELS.get(timeframe, timeframe)
 
         if result is None:
@@ -2307,10 +2792,6 @@ def generate_signal_message(analysis: dict) -> str:
             continue
 
         bias = _timeframe_bias(result.score)
-        price_position = (
-            "di atas" if result.close > result.sma else "di bawah"
-        )
-
         event_labels: list[str] = []
         if result.choch:
             event_labels.append(f"CHoCH {result.choch.title()}")
@@ -2319,31 +2800,22 @@ def generate_signal_message(analysis: dict) -> str:
         if result.sideways:
             event_labels.append("Sideways")
         if result.false_breakout:
-            event_labels.append(
-                f"False BO {result.false_breakout.title()}"
-            )
+            event_labels.append(f"False BO {result.false_breakout.title()}")
 
-        event_text = (
-            " | " + ", ".join(event_labels)
-            if event_labels
-            else ""
-        )
-
+        event_text = f" | {', '.join(event_labels)}" if event_labels else ""
         lines.append(
-            f"• *{label}*: {bias} | Score {result.score:+.2f} | "
-            f"RSI {result.rsi:.1f} | Harga {price_position} SMA20 | "
-            f"Struktur {result.market_structure}{event_text}"
+            f"• *{label}*: {bias} | {result.score:+.2f} | "
+            f"RSI {result.rsi:.1f} | {result.market_structure}{event_text}"
         )
 
     reference_timeframe = analysis.get(
         "atr_reference_tf",
         ENTRY_TIMEFRAME_FOR_ATR,
     )
-    reference_result = analysis["timeframes"].get(reference_timeframe)
+    reference_result = analysis.get("timeframes", {}).get(reference_timeframe)
 
     if reference_result is not None:
         lines.extend(["", "*Struktur & Price Action:*"])
-
         if reference_result.support_level is not None:
             lines.append(
                 f"• Support: {reference_result.support_level:.{decimals}f} "
@@ -2354,81 +2826,87 @@ def generate_signal_message(analysis: dict) -> str:
                 f"• Resistance: {reference_result.resistance_level:.{decimals}f} "
                 f"(strength {reference_result.resistance_strength})"
             )
-        if reference_result.candlestick_patterns:
-            lines.append(
-                "• Pola candle: "
-                + ", ".join(reference_result.candlestick_patterns[:3])
-            )
-        if not reference_result.candlestick_patterns:
-            lines.append("• Pola candle: tidak ada pola kuat")
+        patterns = list(reference_result.candlestick_patterns)
+        lines.append(
+            "• Pola candle: "
+            + (", ".join(patterns[:3]) if patterns else "tidak ada pola kuat")
+        )
 
     lines.append("")
-
     if signal in {"BUY", "SELL"}:
-        entry = analysis["entry_price"]
-        stop_loss = analysis["sl"]
-        take_profit_1 = analysis["tp1"]
-        take_profit_2 = analysis["tp2"]
-        take_profit_3 = analysis["tp3"]
+        entry = analysis.get("entry") or analysis.get("entry_price")
+        stop_loss = analysis.get("sl")
+        tp1 = analysis.get("tp1")
+        tp2 = analysis.get("tp2")
+        tp3 = analysis.get("tp3")
+        rr1 = analysis.get("risk_reward_tp1")
+        rr2 = analysis.get("risk_reward_tp2")
 
         lines.extend(
             [
                 f"*Entry:* {entry:.{decimals}f}",
-                f"*Stop Loss:* {stop_loss:.{decimals}f}",
-                f"*Take Profit 1:* {take_profit_1:.{decimals}f}",
-                f"*Take Profit 2:* {take_profit_2:.{decimals}f}",
-                f"*Take Profit 3:* {take_profit_3:.{decimals}f}",
-                "",
+                f"*SL:* {stop_loss:.{decimals}f}",
+                f"*TP1:* {tp1:.{decimals}f}",
+                f"*TP2:* {tp2:.{decimals}f}",
+                f"*TP3:* {tp3:.{decimals}f}",
                 (
-                    f"_SL/TP menggunakan ATR({ATR_PERIOD}) timeframe "
-                    f"{TIMEFRAME_LABELS.get(reference_timeframe, reference_timeframe)}._"
+                    f"*Risk Reward:* TP1 1:{rr1:.2f} | TP2 1:{rr2:.2f}"
+                    if rr1 is not None and rr2 is not None
+                    else "*Risk Reward:* belum tersedia"
                 ),
             ]
         )
     else:
-        lines.append(
-            "_Tidak ada entry karena konfirmasi belum memenuhi aturan konservatif._"
+        lines.extend(
+            [
+                "*Entry:* —",
+                "*SL:* —",
+                "*TP1:* —",
+                "*TP2:* —",
+                "*Risk Reward:* —",
+                "_Tidak ada entry karena konfirmasi belum memenuhi aturan konservatif._",
+            ]
         )
 
     lines.extend(
         [
             "",
             (
-                f"_Coverage data: {analysis.get('coverage_pct', 0):.1f}% | "
-                f"Keselarasan timeframe: "
-                f"{analysis.get('directional_agreement_pct', 0):.1f}%_"
+                f"_Coverage: {analysis.get('coverage_pct', 0):.1f}% | "
+                f"Alignment: {analysis.get('directional_agreement_pct', 0):.1f}% | "
+                f"Structure: {analysis.get('structure_confirmation_pct', 0):.1f}%_"
             ),
-            (
-                f"_Konfirmasi struktur: "
-                f"{analysis.get('structure_confirmation_pct', 0):.1f}% | "
-                f"Konfirmasi candle: "
-                f"{analysis.get('pattern_confirmation_pct', 0):.1f}%_"
-            ),
-            (
-                "_Confidence Score adalah skor konfluensi internal, "
-                "bukan probabilitas kemenangan._"
-            ),
+            "_Confidence adalah skor konfluensi internal, bukan probabilitas kemenangan._",
             "",
-            (
-                "⚠️ _Bukan saran finansial. Gunakan manajemen risiko "
-                "dan position sizing sendiri._"
-            ),
+            "⚠️ _Bukan saran finansial. Gunakan manajemen risiko sendiri._",
         ]
     )
 
     message = "\n".join(lines)
+    if len(message) <= 4096:
+        return message
 
-    # Batas Telegram 4096 karakter. Pertahankan bagian terpenting jika terlalu panjang.
-    if len(message) > 4000:
-        compact_lines = [
-            line
-            for line in lines
-            if not line.startswith("• Pola candle: tidak ada")
-        ]
-        message = "\n".join(compact_lines)
+    # Kompakkan tanpa memotong Markdown di tengah baris.
+    compact_lines = [
+        line
+        for line in lines
+        if not line.startswith("• Pola candle: tidak ada")
+        and not line.startswith("_Coverage:")
+    ]
+    message = "\n".join(compact_lines)
+    if len(message) <= 4096:
+        return message
 
-    return message[:4096]
-
+    safe_lines: list[str] = []
+    total = 0
+    for line in compact_lines:
+        addition = len(line) + (1 if safe_lines else 0)
+        if total + addition > 4050:
+            break
+        safe_lines.append(line)
+        total += addition
+    safe_lines.append("_Pesan dipadatkan karena batas Telegram._")
+    return "\n".join(safe_lines)
 
 # =============================================================================
 # 10. CALLBACK HANDLER LEGACY
@@ -2438,7 +2916,7 @@ async def button(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """
-    Handler lama untuk tombol analyze_xauusd.
+    Handler legacy untuk tombol analyze_xauusd.
 
     Fungsi ini dipertahankan agar integrasi lama tetap dapat digunakan.
     Pada tahap berikutnya, tes_bot.py akan menjadi pemilik alur Telegram.
