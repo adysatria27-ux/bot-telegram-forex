@@ -1,4 +1,6 @@
 import os
+import math
+import time
 import logging
 
 from telegram import (
@@ -33,6 +35,9 @@ logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+
+# Pengguna yang sama perlu menunggu sebelum meminta symbol yang sama lagi.
+USER_ANALYSIS_COOLDOWN_SECONDS = 15
 
 
 # =============================================================================
@@ -155,15 +160,15 @@ async def button(
     if query is None:
         return
 
-    try:
-        await query.answer()
-    except Exception:
-        logger.exception("Gagal menjawab callback Telegram.")
-        return
-
     symbol = CALLBACK_SYMBOLS.get(query.data)
 
     if symbol is None:
+        try:
+            await query.answer()
+        except Exception:
+            logger.exception("Gagal menjawab callback Telegram.")
+            return
+
         logger.warning(
             "Callback tidak dikenal | callback=%s",
             query.data,
@@ -177,6 +182,39 @@ async def button(
             logger.exception(
                 "Gagal mengirim pesan callback tidak dikenal."
             )
+        return
+
+    cooldown_key = f"last_analysis_request:{symbol}"
+    current_time = time.monotonic()
+    last_request_time = context.user_data.get(cooldown_key)
+
+    if isinstance(last_request_time, (int, float)):
+        elapsed = current_time - last_request_time
+        remaining = USER_ANALYSIS_COOLDOWN_SECONDS - elapsed
+
+        if remaining > 0:
+            try:
+                await query.answer(
+                    text=(
+                        "Mohon tunggu "
+                        f"{math.ceil(remaining)} detik sebelum analisis ulang."
+                    ),
+                    show_alert=True,
+                )
+            except Exception:
+                logger.exception(
+                    "Gagal mengirim pemberitahuan cooldown | symbol=%s",
+                    symbol,
+                )
+            return
+
+    # Waktu dicatat sebelum operasi jaringan agar klik ganda ikut tertahan.
+    context.user_data[cooldown_key] = current_time
+
+    try:
+        await query.answer()
+    except Exception:
+        logger.exception("Gagal menjawab callback Telegram.")
         return
 
     if not API_KEY:
@@ -208,6 +246,15 @@ async def button(
     try:
         analysis = await get_market_data(symbol)
         message = generate_signal_message(analysis)
+
+        logger.info(
+            "Hasil analisis siap | symbol=%s | signal=%s | "
+            "cache_hit=%s | cache_age=%ss",
+            symbol,
+            analysis.get("signal"),
+            analysis.get("cache_hit", False),
+            analysis.get("cache_age_seconds", 0.0),
+        )
 
         await query.edit_message_text(
             message,
