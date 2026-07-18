@@ -37,6 +37,7 @@ Kompatibilitas:
     - Fungsi button() tetap tersedia.
     - Field lama direction, sl, tp, dan atr_value tetap dipertahankan.
     - Cache hasil analisis dan OHLC menghemat request Twelve Data.
+    - Fungsi get_market_candles() tersedia untuk outcome tracker.
 ================================================================================
 """
 
@@ -2680,6 +2681,75 @@ async def _build_market_analysis(
         ),
     }
 
+
+
+async def get_market_candles(
+    symbol: str = DEFAULT_SYMBOL,
+    interval: str = "5min",
+) -> list[dict[str, Any]]:
+    """
+    Mengambil candle kronologis melalui provider resolver dan cache yang sama.
+
+    Fungsi ini disediakan untuk signal outcome tracker agar tidak membuat
+    implementasi pengambilan data yang terpisah atau menambah request ketika
+    OHLC masih tersedia di cache.
+
+    Return:
+        [
+            {
+                "datetime": "2026-07-18T10:00:00",
+                "open": float,
+                "high": float,
+                "low": float,
+                "close": float,
+            },
+            ...
+        ]
+    """
+    canonical_symbol = _normalize_symbol(symbol)
+
+    if interval not in TIMEFRAMES:
+        supported = ", ".join(TIMEFRAMES)
+        raise ValueError(
+            f"Interval '{interval}' tidak didukung. Pilihan: {supported}."
+        )
+
+    asset = _ASSET_BY_SYMBOL[canonical_symbol]
+    provider_symbol = await _resolve_provider_symbol(asset)
+
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        dataframe = await _fetch_ohlc(
+            session,
+            provider_symbol,
+            interval,
+        )
+
+    if dataframe is None or dataframe.empty:
+        raise RuntimeError(
+            f"Data candle {canonical_symbol} timeframe {interval} "
+            "tidak tersedia."
+        )
+
+    candles: list[dict[str, Any]] = []
+    for row in dataframe.itertuples(index=False):
+        candle_time = getattr(row, "datetime")
+        if hasattr(candle_time, "isoformat"):
+            formatted_time = candle_time.isoformat()
+        else:
+            formatted_time = str(candle_time)
+
+        candles.append(
+            {
+                "datetime": formatted_time,
+                "open": float(getattr(row, "open")),
+                "high": float(getattr(row, "high")),
+                "low": float(getattr(row, "low")),
+                "close": float(getattr(row, "close")),
+            }
+        )
+
+    return candles
 
 async def get_market_data(
     symbol: str = DEFAULT_SYMBOL,
