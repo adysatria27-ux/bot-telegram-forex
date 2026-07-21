@@ -258,6 +258,8 @@ def _format_tracker_stats(
     direct_sl = int(summary.get("direct_sl") or 0)
     sl_after_tp = int(summary.get("sl_after_tp") or 0)
     expired = int(summary.get("expired") or 0)
+    win_rate_closed = float(summary.get("win_rate_closed_pct") or 0.0)
+    tp1_hit_rate = float(summary.get("tp1_hit_rate_pct") or 0.0)
     average_confidence = float(
         summary.get("average_trade_confidence") or 0.0
     )
@@ -277,13 +279,15 @@ def _format_tracker_stats(
         f"SL langsung: {direct_sl}",
         f"SL setelah TP: {sl_after_tp}",
         f"Expired: {expired}",
-        f"TP1 hit rate: {float(summary.get('tp1_hit_rate_pct') or 0.0):.1f}%",
+        "",
+        f"Win rate (selesai): {win_rate_closed:.1f}% ({completed} trade)",
+        f"Sentuh TP1 (selesai): {tp1_hit_rate:.1f}%",
         f"Rata-rata confidence trade: {average_confidence:.1f}%",
     ]
 
     buckets = summary.get("confidence_buckets") or []
     if buckets:
-        lines.extend(["", "Confidence Buckets:"])
+        lines.extend(["", "Confidence Buckets (open + selesai):"])
         for bucket in buckets:
             signals = int(bucket.get("signals") or 0)
             wins = int(bucket.get("tp1_or_better") or 0)
@@ -297,6 +301,9 @@ def _format_tracker_stats(
         [
             "",
             "Catatan: TP dan SL pada candle yang sama dihitung SL dahulu.",
+            "Win rate & Sentuh TP1 hanya dari trade yang SUDAH SELESAI. "
+            "SL setelah TP tetap dihitung KALAH "
+            "(bot tidak memindahkan SL ke breakeven / partial close).",
         ]
     )
     return "\n".join(lines)
