@@ -138,7 +138,7 @@ async def handle_message(
 
 
 # =============================================================================
-# 4. SIGNAL LOGGER DAN OUTCOME TRACKER
+# 5. SIGNAL LOGGER DAN OUTCOME TRACKER
 # =============================================================================
 async def _refresh_tracker_symbol(symbol: str) -> dict[str, int]:
     """
@@ -353,7 +353,7 @@ async def stats_command(
         )
 
 # =============================================================================
-# 5. HANDLER ANALISIS GENERIC
+# 6. HANDLER ANALISIS GENERIC
 # =============================================================================
 async def button(
     update: Update,
@@ -491,7 +491,7 @@ async def button(
 
 
 # =============================================================================
-# 6. GLOBAL ERROR HANDLER
+# 7. GLOBAL ERROR HANDLER
 # =============================================================================
 async def error_handler(
     update: object,
@@ -505,7 +505,7 @@ async def error_handler(
 
 
 # =============================================================================
-# 7. MAIN RUNNER
+# 8. MAIN RUNNER
 # =============================================================================
 if __name__ == "__main__":
     if not TOKEN:
