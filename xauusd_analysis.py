@@ -1570,16 +1570,39 @@ def _derive_trend_label(
     structure_score: float,
     trend_score: float,
     momentum_score: float,
+    bos: Optional[str] = None,
+    choch: Optional[str] = None,
 ) -> str:
-    """Menentukan Bullish, Bearish, atau Sideways."""
-    if sideways:
-        return "Sideways"
+    """
+    Menentukan Bullish, Bearish, atau Sideways.
 
+    REVISI (Stage 4): Label "sideways" dihitung dari efisiensi pergerakan
+    harga 20 candle TERAKHIR -- ukuran ini lamban, jadi begitu ada breakout
+    baru, beberapa candle pertama sesudahnya masih bisa tercatat "sideways"
+    walau strukturnya sudah jelas berubah arah (BOS/CHoCH baru saja
+    terkonfirmasi). Sebelumnya sideways=True langsung memaksa "Sideways"
+    tanpa syarat, sehingga BOS/CHoCH yang lebih baru dan lebih relevan jadi
+    diabaikan sepenuhnya. Sekarang BOS/CHoCH yang baru terkonfirmasi dan
+    SEARAH dengan combined_direction boleh membatalkan label sideways itu.
+    """
     combined_direction = (
         (0.55 * structure_score)
         + (0.30 * trend_score)
         + (0.15 * momentum_score)
     )
+
+    fresh_break_direction: Optional[str] = None
+    if choch == "BULLISH" or bos == "BULLISH":
+        fresh_break_direction = "Bullish"
+    elif choch == "BEARISH" or bos == "BEARISH":
+        fresh_break_direction = "Bearish"
+
+    if sideways:
+        if fresh_break_direction == "Bullish" and combined_direction > 0:
+            return "Bullish"
+        if fresh_break_direction == "Bearish" and combined_direction < 0:
+            return "Bearish"
+        return "Sideways"
 
     if combined_direction >= 0.20:
         return "Bullish"
@@ -1766,6 +1789,8 @@ def _score_timeframe(
         structure_score,
         trend_score,
         momentum_score,
+        bos=bos,
+        choch=choch,
     )
 
     total_score = (
