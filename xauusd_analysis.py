@@ -290,9 +290,20 @@ MOMENTUM_LOOKBACK = 3
 ENTRY_TIMEFRAME_FOR_ATR = "15min"
 
 ATR_SL_MULTIPLIER = 1.5
-ATR_TP1_MULTIPLIER = 1.5
-ATR_TP2_MULTIPLIER = 2.5
-ATR_TP3_MULTIPLIER = 4.0
+
+# PENTING: TP tidak lagi memakai kelipatan ATR yang independen dari SL.
+# Sebelumnya TP1=1.5x dan TP2=2.5x ATR menghasilkan RR tetap 1:1.0 dan 1:1.67,
+# yang secara matematis TIDAK PERNAH bisa mencapai minimum 1:2 berapa pun
+# kuatnya confidence. Sekarang TP diturunkan langsung dari jarak SL dikali
+# target RR, sehingga RR minimum terjamin by design, bukan kebetulan.
+RR_TARGET_TP1 = 2.0
+RR_TARGET_TP2 = 3.0
+RR_TARGET_TP3 = 4.0
+
+# Risk Reward minimum yang wajib dipenuhi TP1 agar sinyal boleh keluar.
+# Ditegakkan juga sebagai hard-gate di _build_market_analysis, bukan cuma
+# konsekuensi tidak langsung dari multiplier di atas.
+MIN_RISK_REWARD_RATIO = 2.0
 
 # Sistem dibuat konservatif karena akurasi lebih penting daripada jumlah sinyal.
 SIGNAL_SCORE_THRESHOLD = 0.25
@@ -1947,6 +1958,58 @@ def _calculate_pattern_confirmation(
     return confirmed_weight / total_weight if total_weight > 0 else 0.0
 
 
+def _calculate_trend_alignment_score(
+    trend: str,
+    candidate_signal: str,
+) -> float:
+    """
+    Skor keselarasan kontinu antara trend timeframe besar dan calon sinyal.
+
+    Sebelumnya trend besar dipakai sebagai syarat mutlak (harus persis sama
+    dengan calon sinyal, kalau tidak langsung HOLD). Itu membuat satu label
+    "Sideways" di H1/H4 bisa membatalkan sinyal walau timeframe lain sangat
+    kuat. Sekarang trend besar tetap berpengaruh besar (lihat pembobotan di
+    _calculate_confidence_score), tapi secara proporsional:
+        - Searah penuh  -> 1.0
+        - Netral/Sideways -> 0.5 (tidak mendukung, tapi juga tidak menghukum)
+        - Berlawanan    -> 0.0 (biarkan _calculate_counter_trend_penalty yang
+          menghukum lebih lanjut kalau berlawanan secara kuat)
+    """
+    if candidate_signal not in {"BUY", "SELL"}:
+        return 0.0
+
+    target_trend = "Bullish" if candidate_signal == "BUY" else "Bearish"
+
+    if trend == target_trend:
+        return 1.0
+    if trend == "Sideways":
+        return 0.5
+    return 0.0
+
+
+def _calculate_counter_trend_penalty(
+    trend: str,
+    higher_timeframe_score: float,
+    candidate_signal: str,
+) -> float:
+    """
+    Penalti proporsional saat calon sinyal melawan trend besar yang kuat.
+
+    Hanya aktif kalau trend besar benar-benar berlawanan arah (bukan sekadar
+    Sideways) dan kekuatannya (higher_timeframe_score) signifikan. Nilainya
+    0.0-1.0, dipakai mengurangi confidence secara proporsional, bukan
+    memveto total seperti logika lama.
+    """
+    if candidate_signal not in {"BUY", "SELL"}:
+        return 0.0
+
+    opposite_trend = "Bearish" if candidate_signal == "BUY" else "Bullish"
+    if trend != opposite_trend:
+        return 0.0
+
+    return float(np.clip(abs(higher_timeframe_score), 0.0, 1.0))
+
+
 def _calculate_sideways_ratio(
     timeframe_results: dict[str, TimeframeResult],
 ) -> float:
@@ -1998,37 +2061,50 @@ def _calculate_confidence_score(
     coverage_ratio: float,
     structure_confirmation: float = 0.0,
     pattern_confirmation: float = 0.0,
+    trend_alignment_score: float = 0.0,
     sideways_ratio: float = 0.0,
     false_breakout_against_ratio: float = 0.0,
+    counter_trend_penalty: float = 0.0,
 ) -> float:
     """
     Menghitung Confidence Score konfluensi internal.
 
     Struktur market dan candlestick dapat meningkatkan confidence jika searah.
-    Sideways dan false breakout yang melawan arah mengurangi confidence.
+    Sideways, false breakout yang melawan arah, dan trend besar yang
+    berlawanan kuat akan mengurangi confidence secara proporsional.
+
+    Catatan desain (revisi):
+    Trend timeframe besar sebelumnya adalah syarat mutlak terpisah (harus
+    identik dengan calon sinyal, kalau tidak otomatis HOLD). Sekarang trend
+    besar masuk sebagai komponen berbobot (trend_alignment_score) plus
+    penalti proporsional saat benar-benar berlawanan (counter_trend_penalty).
+    Sinyal yang sangat kuat di timeframe kecil-menengah tidak lagi otomatis
+    gugur hanya karena H1/H4 sedang diklasifikasikan Sideways.
     """
     normalized_strength = min(abs(combined_score) / 0.60, 1.0)
 
     confidence = 100.0 * (
-        (0.38 * normalized_strength)
-        + (0.22 * directional_agreement)
-        + (0.15 * coverage_ratio)
-        + (0.17 * structure_confirmation)
-        + (0.08 * pattern_confirmation)
+        (0.28 * normalized_strength)
+        + (0.18 * directional_agreement)
+        + (0.12 * coverage_ratio)
+        + (0.15 * structure_confirmation)
+        + (0.07 * pattern_confirmation)
+        + (0.20 * float(np.clip(trend_alignment_score, 0.0, 1.0)))
     )
 
     penalty_multiplier = (
         1.0
-        - (0.22 * float(np.clip(sideways_ratio, 0.0, 1.0)))
+        - (0.20 * float(np.clip(sideways_ratio, 0.0, 1.0)))
         - (
-            0.35
+            0.30
             * float(
                 np.clip(false_breakout_against_ratio, 0.0, 1.0)
             )
         )
+        - (0.25 * float(np.clip(counter_trend_penalty, 0.0, 1.0)))
     )
 
-    confidence *= max(0.35, penalty_multiplier)
+    confidence *= max(0.30, penalty_multiplier)
 
     return round(float(np.clip(confidence, 0.0, 100.0)), 1)
 
@@ -2040,12 +2116,17 @@ def _classify_signal_risk(
     coverage_ratio: float,
     sideways_ratio: float = 0.0,
     false_breakout_against_ratio: float = 0.0,
+    counter_trend_penalty: float = 0.0,
 ) -> str:
     """Mengklasifikasikan risiko kualitas sinyal."""
     if signal == "HOLD":
         return "Tinggi"
 
-    if false_breakout_against_ratio > 0.0 or sideways_ratio > 0.50:
+    if (
+        false_breakout_against_ratio > 0.0
+        or sideways_ratio > 0.50
+        or counter_trend_penalty >= 0.35
+    ):
         return "Tinggi"
 
     if (
@@ -2053,6 +2134,7 @@ def _classify_signal_risk(
         and directional_agreement >= 0.80
         and coverage_ratio >= 0.90
         and sideways_ratio <= 0.25
+        and counter_trend_penalty == 0.0
     ):
         return "Rendah"
 
@@ -2078,6 +2160,9 @@ def _build_reasons(
     pattern_confirmation: float = 0.0,
     sideways_ratio: float = 0.0,
     false_breakout_against_ratio: float = 0.0,
+    risk_reward_tp1: Optional[float] = None,
+    counter_trend_penalty: float = 0.0,
+    risk_reward_ok: bool = True,
 ) -> list[str]:
     """Membuat alasan analisis yang mudah dipahami manusia."""
     reasons: list[str] = []
@@ -2099,9 +2184,9 @@ def _build_reasons(
             reasons.append(
                 "Data timeframe yang tersedia belum cukup lengkap."
             )
-        if trend == "Sideways" or sideways_ratio > 0.50:
+        if sideways_ratio > 0.50:
             reasons.append(
-                "Market terdeteksi sideways atau tren timeframe besar belum jelas."
+                "Sebagian besar timeframe masih terdeteksi sideways."
             )
         if false_breakout_against_ratio > 0.0:
             reasons.append(
@@ -2110,6 +2195,20 @@ def _build_reasons(
         if structure_confirmation < MIN_STRUCTURE_CONFIRMATION:
             reasons.append(
                 "HH/HL, LH/LL, BOS, atau CHoCH belum memberi konfirmasi kuat."
+            )
+        if not risk_reward_ok:
+            rr_text = (
+                f"1:{risk_reward_tp1:.2f}"
+                if risk_reward_tp1 is not None
+                else "tidak dapat dihitung"
+            )
+            reasons.append(
+                "Risk Reward TP1 belum memenuhi minimum "
+                f"1:{MIN_RISK_REWARD_RATIO:.1f} (saat ini {rr_text})."
+            )
+        if counter_trend_penalty >= 0.35:
+            reasons.append(
+                "Calon sinyal melawan trend kuat di timeframe besar (H1/H4)."
             )
         if not reasons:
             reasons.append(
@@ -2172,6 +2271,16 @@ def _build_reasons(
             reasons.append(
                 "Candlestick pattern meningkatkan konfluensi sinyal."
             )
+        if risk_reward_tp1 is not None:
+            reasons.append(
+                f"Risk Reward TP1 mencapai 1:{risk_reward_tp1:.2f} "
+                f"(minimum 1:{MIN_RISK_REWARD_RATIO:.1f})."
+            )
+        if counter_trend_penalty > 0.0:
+            reasons.append(
+                "Catatan: sinyal ini melawan sebagian trend timeframe besar, "
+                "gunakan manajemen risiko lebih ketat."
+            )
 
     if missing_timeframes:
         labels = [
@@ -2217,6 +2326,7 @@ def _build_indicator_checklist(
     false_breakout_filter_passed: bool,
     timeframe_results: dict[str, TimeframeResult],
     reference_result: TimeframeResult,
+    risk_reward_tp1: Optional[float] = None,
 ) -> list[dict[str, str]]:
     """Membuat checklist indikator yang stabil untuk API dan Telegram."""
     checklist: list[dict[str, str]] = []
@@ -2308,6 +2418,18 @@ def _build_indicator_checklist(
         "PASS" if false_breakout_filter_passed else "FAIL",
         "Lolos" if false_breakout_filter_passed else "Terdeteksi risiko false breakout",
     )
+
+    if risk_reward_tp1 is not None:
+        if risk_reward_tp1 >= MIN_RISK_REWARD_RATIO:
+            add("Risk Reward (TP1)", "PASS", f"1:{risk_reward_tp1:.2f}")
+        else:
+            add(
+                "Risk Reward (TP1)",
+                "FAIL",
+                f"1:{risk_reward_tp1:.2f} (min 1:{MIN_RISK_REWARD_RATIO:.1f})",
+            )
+    else:
+        add("Risk Reward (TP1)", "WARN", "Belum dapat dihitung")
 
     if signal in {"BUY", "SELL"}:
         add("Keputusan final", "PASS", signal)
@@ -2439,6 +2561,15 @@ async def _build_market_analysis(
             candidate_signal,
         )
     )
+    trend_alignment_score = _calculate_trend_alignment_score(
+        trend,
+        candidate_signal,
+    )
+    counter_trend_penalty = _calculate_counter_trend_penalty(
+        trend,
+        higher_timeframe_score,
+        candidate_signal,
+    )
 
     confidence_pct = _calculate_confidence_score(
         combined_score,
@@ -2446,8 +2577,68 @@ async def _build_market_analysis(
         coverage_ratio,
         structure_confirmation,
         pattern_confirmation,
+        trend_alignment_score,
         sideways_ratio,
         false_breakout_against_ratio,
+        counter_trend_penalty,
+    )
+
+    # ------------------------------------------------------------------
+    # Entry/SL/TP dihitung dari SEKARANG (berdasarkan candidate_signal),
+    # bukan setelah signal final ditentukan. Ini perlu agar Risk Reward
+    # bisa ikut menjadi syarat kelayakan sinyal (poin 8), bukan sekadar
+    # angka yang dihitung belakangan setelah keputusan sudah diambil.
+    # ------------------------------------------------------------------
+    reference_timeframe = (
+        ENTRY_TIMEFRAME_FOR_ATR
+        if ENTRY_TIMEFRAME_FOR_ATR in timeframe_results
+        else next(iter(timeframe_results))
+    )
+    reference_result = timeframe_results[reference_timeframe]
+    entry_price = latest_prices.get(
+        reference_timeframe,
+        reference_result.close,
+    )
+    atr_value = reference_result.atr
+
+    prospective_sl: Optional[float] = None
+    prospective_tp1: Optional[float] = None
+    prospective_tp2: Optional[float] = None
+    prospective_tp3: Optional[float] = None
+
+    if candidate_signal == "BUY":
+        prospective_sl = entry_price - (ATR_SL_MULTIPLIER * atr_value)
+        risk_distance = entry_price - prospective_sl
+        prospective_tp1 = entry_price + (risk_distance * RR_TARGET_TP1)
+        prospective_tp2 = entry_price + (risk_distance * RR_TARGET_TP2)
+        prospective_tp3 = entry_price + (risk_distance * RR_TARGET_TP3)
+    elif candidate_signal == "SELL":
+        prospective_sl = entry_price + (ATR_SL_MULTIPLIER * atr_value)
+        risk_distance = prospective_sl - entry_price
+        prospective_tp1 = entry_price - (risk_distance * RR_TARGET_TP1)
+        prospective_tp2 = entry_price - (risk_distance * RR_TARGET_TP2)
+        prospective_tp3 = entry_price - (risk_distance * RR_TARGET_TP3)
+
+    risk_reward_tp1 = _calculate_risk_reward(
+        entry_price if candidate_signal in {"BUY", "SELL"} else None,
+        prospective_sl,
+        prospective_tp1,
+    )
+    risk_reward_tp2 = _calculate_risk_reward(
+        entry_price if candidate_signal in {"BUY", "SELL"} else None,
+        prospective_sl,
+        prospective_tp2,
+    )
+    risk_reward_tp3 = _calculate_risk_reward(
+        entry_price if candidate_signal in {"BUY", "SELL"} else None,
+        prospective_sl,
+        prospective_tp3,
+    )
+
+    enough_risk_reward = (
+        candidate_signal in {"BUY", "SELL"}
+        and risk_reward_tp1 is not None
+        and risk_reward_tp1 >= MIN_RISK_REWARD_RATIO
     )
 
     enough_timeframes = len(timeframe_results) >= MIN_TIMEFRAMES_FOR_SIGNAL
@@ -2466,25 +2657,20 @@ async def _build_market_analysis(
         <= MAX_FALSE_BREAKOUT_AGAINST_RATIO
     )
 
-    higher_timeframe_false_breakout = any(
-        (
-            candidate_signal == "BUY"
-            and timeframe_results[timeframe].false_breakout == "BULLISH"
-        )
-        or (
-            candidate_signal == "SELL"
-            and timeframe_results[timeframe].false_breakout == "BEARISH"
-        )
-        for timeframe in HIGHER_TIMEFRAMES
-        if timeframe in timeframe_results
-    )
-
-    trend_aligned = (
-        candidate_signal == "BUY" and trend == "Bullish"
-    ) or (
-        candidate_signal == "SELL" and trend == "Bearish"
-    )
-
+    # ------------------------------------------------------------------
+    # REVISI GATING (Stage 2):
+    # Dua syarat lama di sini SEBELUMNYA bersifat veto mutlak:
+    #   - trend_aligned: trend H1/H4 harus PERSIS sama dengan calon sinyal.
+    #     Satu label "Sideways" di H1 saja sudah membatalkan segalanya.
+    #   - higher_timeframe_false_breakout: satu wick gagal breakout di
+    #     H1/H4 langsung memveto, walau timeframe lain sangat kuat.
+    # Keduanya sekarang sudah masuk sebagai komponen BERBOBOT dan penalti
+    # PROPORSIONAL di dalam confidence_pct (trend_alignment_score,
+    # counter_trend_penalty, dan false_breakout_against_ratio yang memang
+    # sudah memberi bobot lebih besar ke H1/H4 lewat TIMEFRAME_WEIGHTS).
+    # Hard-gate yang tersisa hanya untuk hal yang benar-benar tidak layak
+    # ditawar: kualitas data, konfluensi minimum, dan Risk Reward.
+    # ------------------------------------------------------------------
     if (
         candidate_signal in {"BUY", "SELL"}
         and enough_timeframes
@@ -2494,8 +2680,7 @@ async def _build_market_analysis(
         and enough_structure
         and not_too_sideways
         and false_breakout_filter_passed
-        and not higher_timeframe_false_breakout
-        and trend_aligned
+        and enough_risk_reward
     ):
         signal = candidate_signal
     else:
@@ -2503,49 +2688,10 @@ async def _build_market_analysis(
 
     direction = "NEUTRAL" if signal == "HOLD" else signal
 
-    reference_timeframe = (
-        ENTRY_TIMEFRAME_FOR_ATR
-        if ENTRY_TIMEFRAME_FOR_ATR in timeframe_results
-        else next(iter(timeframe_results))
-    )
-    reference_result = timeframe_results[reference_timeframe]
-    entry_price = latest_prices.get(
-        reference_timeframe,
-        reference_result.close,
-    )
-    atr_value = reference_result.atr
-
-    stop_loss: Optional[float] = None
-    take_profit_1: Optional[float] = None
-    take_profit_2: Optional[float] = None
-    take_profit_3: Optional[float] = None
-
-    if signal == "BUY":
-        stop_loss = entry_price - (ATR_SL_MULTIPLIER * atr_value)
-        take_profit_1 = entry_price + (ATR_TP1_MULTIPLIER * atr_value)
-        take_profit_2 = entry_price + (ATR_TP2_MULTIPLIER * atr_value)
-        take_profit_3 = entry_price + (ATR_TP3_MULTIPLIER * atr_value)
-    elif signal == "SELL":
-        stop_loss = entry_price + (ATR_SL_MULTIPLIER * atr_value)
-        take_profit_1 = entry_price - (ATR_TP1_MULTIPLIER * atr_value)
-        take_profit_2 = entry_price - (ATR_TP2_MULTIPLIER * atr_value)
-        take_profit_3 = entry_price - (ATR_TP3_MULTIPLIER * atr_value)
-
-    risk_reward_tp1 = _calculate_risk_reward(
-        entry_price if signal in {"BUY", "SELL"} else None,
-        stop_loss,
-        take_profit_1,
-    )
-    risk_reward_tp2 = _calculate_risk_reward(
-        entry_price if signal in {"BUY", "SELL"} else None,
-        stop_loss,
-        take_profit_2,
-    )
-    risk_reward_tp3 = _calculate_risk_reward(
-        entry_price if signal in {"BUY", "SELL"} else None,
-        stop_loss,
-        take_profit_3,
-    )
+    stop_loss = prospective_sl if signal in {"BUY", "SELL"} else None
+    take_profit_1 = prospective_tp1 if signal in {"BUY", "SELL"} else None
+    take_profit_2 = prospective_tp2 if signal in {"BUY", "SELL"} else None
+    take_profit_3 = prospective_tp3 if signal in {"BUY", "SELL"} else None
 
     indicator_checklist = _build_indicator_checklist(
         candidate_signal=candidate_signal,
@@ -2557,12 +2703,10 @@ async def _build_market_analysis(
         structure_confirmation=structure_confirmation,
         pattern_confirmation=pattern_confirmation,
         sideways_ratio=sideways_ratio,
-        false_breakout_filter_passed=(
-            false_breakout_filter_passed
-            and not higher_timeframe_false_breakout
-        ),
+        false_breakout_filter_passed=false_breakout_filter_passed,
         timeframe_results=timeframe_results,
         reference_result=reference_result,
+        risk_reward_tp1=risk_reward_tp1,
     )
 
     missing_timeframes = [
@@ -2578,6 +2722,7 @@ async def _build_market_analysis(
         coverage_ratio,
         sideways_ratio,
         false_breakout_against_ratio,
+        counter_trend_penalty,
     )
 
     reasons = _build_reasons(
@@ -2593,6 +2738,9 @@ async def _build_market_analysis(
         pattern_confirmation=pattern_confirmation,
         sideways_ratio=sideways_ratio,
         false_breakout_against_ratio=false_breakout_against_ratio,
+        risk_reward_tp1=risk_reward_tp1,
+        counter_trend_penalty=counter_trend_penalty,
+        risk_reward_ok=enough_risk_reward,
     )
 
     logger.info(
@@ -2671,10 +2819,11 @@ async def _build_market_analysis(
             false_breakout_against_ratio * 100,
             1,
         ),
-        "false_breakout_filter_passed": (
-            false_breakout_filter_passed
-            and not higher_timeframe_false_breakout
-        ),
+        "false_breakout_filter_passed": false_breakout_filter_passed,
+        "trend_alignment_score": round(trend_alignment_score, 2),
+        "counter_trend_penalty": round(counter_trend_penalty, 2),
+        "min_risk_reward_ratio": MIN_RISK_REWARD_RATIO,
+        "risk_reward_ok": enough_risk_reward,
         "confidence_note": (
             "Confidence Score adalah skor konfluensi internal dan "
             "belum menjadi probabilitas kemenangan."
