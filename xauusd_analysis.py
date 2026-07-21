@@ -327,7 +327,21 @@ SIDEWAYS_EFFICIENCY_THRESHOLD = 0.30
 SIDEWAYS_SLOPE_ATR_THRESHOLD = 0.15
 MIN_STRUCTURE_CONFIRMATION = 0.18
 MAX_SIDEWAYS_RATIO_FOR_SIGNAL = 0.60
-MAX_FALSE_BREAKOUT_AGAINST_RATIO = 0.25
+
+# REVISI GATING (Stage 3):
+# Total bobot TIMEFRAME_WEIGHTS adalah 1.0+1.5+2.0+2.5 = 7.0. Ambang lama
+# (0.25) setara 1.75 dari total bobot itu, padahal bobot 1h saja sudah 2.5
+# dan bobot 30m saja sudah 2.0 -- keduanya SENDIRIAN sudah melebihi 1.75.
+# Akibatnya satu timeframe besar saja yang mendeteksi "gagal breakout" bisa
+# memveto total sinyal, walau tiga timeframe lain sepakat kuat ke arah
+# sebaliknya. Ini bertentangan dengan prinsip multi-timeframe confluence
+# yang jadi inti sistem ini. Ambang dinaikkan ke 0.50 supaya veto total
+# baru berlaku kalau MAYORITAS bobot timeframe sepakat menunjukkan gagal
+# breakout melawan arah sinyal (bukan cuma satu timeframe sendirian).
+# Efeknya terhadap confidence_pct (penalti proporsional 0.30 x rasio ini)
+# TIDAK diubah -- sinyal dengan sedikit false breakout tetap mengalami
+# pengurangan confidence, cuma tidak lagi otomatis gugur total karenanya.
+MAX_FALSE_BREAKOUT_AGAINST_RATIO = 0.50
 
 
 @dataclass(frozen=True)
