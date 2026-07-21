@@ -931,6 +931,29 @@ def get_performance_summary(days: int = 30) -> dict[str, Any]:
                     AS sl_after_tp,
                 SUM(CASE WHEN outcome LIKE '%EXPIRED%' THEN 1 ELSE 0 END)
                     AS expired,
+                SUM(
+                    CASE
+                        WHEN signal IN ('BUY', 'SELL')
+                         AND status = 'CLOSED'
+                         AND max_tp_hit >= 1
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS completed_tp1_or_better,
+                SUM(
+                    CASE
+                        WHEN signal IN ('BUY', 'SELL')
+                         AND status = 'CLOSED'
+                         AND entry IS NOT NULL
+                         AND outcome_price IS NOT NULL
+                         AND (
+                             (signal = 'BUY' AND outcome_price > entry)
+                             OR (signal = 'SELL' AND outcome_price < entry)
+                         )
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS completed_wins,
                 AVG(
                     CASE
                         WHEN signal IN ('BUY', 'SELL')
@@ -977,14 +1000,39 @@ def get_performance_summary(days: int = 30) -> dict[str, Any]:
 
     summary = dict(row) if row is not None else {}
     completed = int(summary.get("completed_trades") or 0)
-    tp1_or_better = int(summary.get("tp1_or_better") or 0)
+    completed_tp1_or_better = int(
+        summary.get("completed_tp1_or_better") or 0
+    )
+    completed_wins = int(summary.get("completed_wins") or 0)
 
     summary["days"] = safe_days
+
+    # tp1_hit_rate_pct: dari trade yang SUDAH SELESAI (CLOSED), berapa persen
+    # yang sempat menyentuh TP1 atau lebih. Pembilang dan penyebut kini SAMA-SAMA
+    # hanya menghitung trade CLOSED. Sebelumnya pembilang keliru ikut menghitung
+    # trade yang masih OPEN (max_tp_hit >= 1 tanpa filter status), sementara
+    # penyebut hanya CLOSED -> angka bisa sangat menyesatkan (mis. 90-100%).
     summary["tp1_hit_rate_pct"] = (
-        round((tp1_or_better / completed) * 100, 1)
+        round((completed_tp1_or_better / completed) * 100, 1)
         if completed > 0
         else 0.0
     )
+
+    # win_rate_closed_pct: win rate FINAL yang benar-benar terealisasi.
+    # Sebuah trade dihitung MENANG hanya jika harga penutupannya (outcome_price)
+    # berada di sisi profit relatif terhadap entry (BUY: close > entry,
+    # SELL: close < entry). Karena tracker TIDAK memindahkan SL ke breakeven dan
+    # TIDAK melakukan partial close, outcome "SL setelah TP" tetap dihitung
+    # KALAH (rugi penuh di SL), bukan menang. Ini metrik paling jujur untuk
+    # menilai performa nyata, terpisah dari sekadar "sempat menyentuh TP1".
+    summary["win_rate_closed_pct"] = (
+        round((completed_wins / completed) * 100, 1)
+        if completed > 0
+        else 0.0
+    )
+
+    summary["completed_tp1_or_better"] = completed_tp1_or_better
+    summary["completed_wins"] = completed_wins
     summary["confidence_buckets"] = [
         dict(bucket_row)
         for bucket_row in bucket_rows
