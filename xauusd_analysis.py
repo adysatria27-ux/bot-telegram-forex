@@ -11,20 +11,41 @@ Tujuan:
     crypto, dan indeks menggunakan satu pipeline analisis yang sama.
 
 Indikator saat ini:
-    - RSI 14
+    - RSI 14 (level + divergence + label momentum menguat/melemah)
+    - EMA 9/21 (posisi harga, jarak/spread, kemiringan/slope trend)
     - SMA 20
     - Bollinger Bands 20,2
-    - ATR 14
+    - ATR 14 (untuk SL/TP dinamis, bukan angka tetap)
     - Momentum harga
     - Support dan Resistance
+    - Supply Zone dan Demand Zone
+    - Level psikologis harga (per aset, lihat AssetConfig.psychological_increment)
     - Swing High dan Swing Low
     - HH, HL, LH, dan LL
     - Break of Structure (BOS)
     - Change of Character (CHoCH)
     - Sideways Detection
     - False Breakout Filter
-    - Candlestick Pattern
-    - Multi-timeframe weighting
+    - Candlestick Pattern (Engulfing, Pin Bar, Hammer, Shooting Star,
+      Morning/Evening Star, Inside Bar, Doji)
+    - Multi-timeframe weighting (M5, M15, M30, H1, H4)
+
+Keputusan desain -- Volume (P5):
+    Modul ini SENGAJA tidak menggunakan volume sebagai faktor skor, baik di
+    total_score (_score_timeframe) maupun confidence_pct
+    (_calculate_confidence_score). Alasannya bukan kelalaian, tapi
+    keterbatasan data: Twelve Data tidak menyediakan angka volume riil untuk
+    pasangan forex maupun XAU/USD spot (pasar OTC/desentralisasi, beda
+    dengan saham atau futures yang punya volume terpusat). Volume "tick
+    count" dari sebagian broker bukan representasi volume pasar sesungguhnya
+    dan bisa menyesatkan kalau dipaksakan jadi faktor confidence.
+    Bobot yang tadinya dialokasikan untuk volume dialihkan secara
+    proporsional ke Trend dan Market Structure -- dua faktor dengan data
+    paling reliable dari OHLC. Jika di masa depan sumber data diganti ke
+    yang menyediakan volume riil (misalnya data futures/CME), slot untuk
+    volume_score bisa ditambahkan kembali tanpa mengubah arsitektur inti
+    (lihat komentar peta bobot di _score_timeframe() dan
+    _calculate_confidence_score()).
 
 Catatan penting:
     Confidence Score pada versi ini adalah skor kualitas konfluensi internal.
@@ -34,10 +55,12 @@ Catatan penting:
 Kompatibilitas:
     - Fungsi get_market_data() tetap tersedia.
     - Fungsi generate_signal_message() tetap tersedia.
-    - Fungsi button() tetap tersedia.
     - Field lama direction, sl, tp, dan atr_value tetap dipertahankan.
     - Cache hasil analisis dan OHLC menghemat request Twelve Data.
     - Fungsi get_market_candles() tersedia untuk outcome tracker.
+    - Handler Telegram button() legacy sudah dihapus (dead code, tidak pernah
+      dipanggil -- tes_bot.py sudah punya handler sendiri). Modul ini sekarang
+      tidak lagi bergantung pada python-telegram-bot sama sekali.
 ================================================================================
 """
 
@@ -52,9 +75,6 @@ from typing import Any, Optional
 import aiohttp
 import numpy as np
 import pandas as pd
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ContextTypes
 
 
 logger = logging.getLogger(__name__)
@@ -123,6 +143,13 @@ class AssetConfig:
     analysis_cache_ttl_seconds: int = ANALYSIS_CACHE_TTL_SECONDS
     aliases: tuple[str, ...] = ()
     legacy_menu_texts: tuple[str, ...] = ()
+    # P6 -- jarak antar level psikologis (angka bulat) yang wajar untuk
+    # aset ini. Beda-beda per instrumen karena skala harga & kebiasaan
+    # trader beda (gold per $10-50, forex major per 50 pip, dst). Tidak
+    # bisa disimpulkan otomatis dari harga saja karena forex yang harganya
+    # ~1.10 dan indeks yang harganya ~4000 sama-sama satu digit di depan
+    # tapi granularitas pip/poin-nya jauh berbeda.
+    psychological_increment: float = 0.0
 
 
 SUPPORTED_ASSETS: tuple[AssetConfig, ...] = (
@@ -132,6 +159,7 @@ SUPPORTED_ASSETS: tuple[AssetConfig, ...] = (
         asset_class="metal",
         decimals=2,
         callback_data="analyze_xauusd",
+        psychological_increment=10.0,
         menu_label="XAU/USD",
         aliases=("XAUUSD", "GOLD"),
         legacy_menu_texts=("Cek Harga XAUUSD",),
@@ -142,6 +170,7 @@ SUPPORTED_ASSETS: tuple[AssetConfig, ...] = (
         asset_class="metal",
         decimals=3,
         callback_data="analyze_xagusd",
+        psychological_increment=0.5,
         menu_label="XAG/USD",
         aliases=("XAGUSD", "SILVER"),
     ),
@@ -151,6 +180,7 @@ SUPPORTED_ASSETS: tuple[AssetConfig, ...] = (
         asset_class="forex",
         decimals=5,
         callback_data="analyze_eurusd",
+        psychological_increment=0.0050,
         menu_label="EUR/USD",
         aliases=("EURUSD",),
         legacy_menu_texts=("Cek Harga EURUSD",),
@@ -161,6 +191,7 @@ SUPPORTED_ASSETS: tuple[AssetConfig, ...] = (
         asset_class="forex",
         decimals=5,
         callback_data="analyze_gbpusd",
+        psychological_increment=0.0050,
         menu_label="GBP/USD",
         aliases=("GBPUSD",),
     ),
@@ -170,6 +201,7 @@ SUPPORTED_ASSETS: tuple[AssetConfig, ...] = (
         asset_class="forex",
         decimals=3,
         callback_data="analyze_usdjpy",
+        psychological_increment=0.50,
         menu_label="USD/JPY",
         aliases=("USDJPY",),
     ),
@@ -179,6 +211,7 @@ SUPPORTED_ASSETS: tuple[AssetConfig, ...] = (
         asset_class="forex",
         decimals=5,
         callback_data="analyze_audusd",
+        psychological_increment=0.0050,
         menu_label="AUD/USD",
         aliases=("AUDUSD",),
     ),
@@ -188,6 +221,7 @@ SUPPORTED_ASSETS: tuple[AssetConfig, ...] = (
         asset_class="forex",
         decimals=5,
         callback_data="analyze_nzdusd",
+        psychological_increment=0.0050,
         menu_label="NZD/USD",
         aliases=("NZDUSD",),
     ),
@@ -197,6 +231,7 @@ SUPPORTED_ASSETS: tuple[AssetConfig, ...] = (
         asset_class="forex",
         decimals=5,
         callback_data="analyze_usdcad",
+        psychological_increment=0.0050,
         menu_label="USD/CAD",
         aliases=("USDCAD",),
     ),
@@ -206,6 +241,7 @@ SUPPORTED_ASSETS: tuple[AssetConfig, ...] = (
         asset_class="forex",
         decimals=5,
         callback_data="analyze_usdchf",
+        psychological_increment=0.0050,
         menu_label="USD/CHF",
         aliases=("USDCHF",),
     ),
@@ -215,6 +251,7 @@ SUPPORTED_ASSETS: tuple[AssetConfig, ...] = (
         asset_class="crypto",
         decimals=2,
         callback_data="analyze_btcusd",
+        psychological_increment=500.0,
         menu_label="BTC/USD",
         analysis_cache_ttl_seconds=20,
         aliases=("BTCUSD", "BITCOIN"),
@@ -225,6 +262,7 @@ SUPPORTED_ASSETS: tuple[AssetConfig, ...] = (
         asset_class="crypto",
         decimals=2,
         callback_data="analyze_ethusd",
+        psychological_increment=50.0,
         menu_label="ETH/USD",
         analysis_cache_ttl_seconds=20,
         aliases=("ETHUSD", "ETHEREUM"),
@@ -235,6 +273,7 @@ SUPPORTED_ASSETS: tuple[AssetConfig, ...] = (
         asset_class="index",
         decimals=2,
         callback_data="analyze_nas100",
+        psychological_increment=50.0,
         menu_label="NAS100",
         aliases=("NDX", "NASDAQ100", "NASDAQ 100"),
     ),
@@ -244,6 +283,7 @@ SUPPORTED_ASSETS: tuple[AssetConfig, ...] = (
         asset_class="index",
         decimals=2,
         callback_data="analyze_us30",
+        psychological_increment=100.0,
         menu_label="US30",
         aliases=("DJI", "DJIA", "DOW", "DOW30"),
     ),
@@ -287,6 +327,21 @@ BB_STD_DEV = 2.0
 ATR_PERIOD = 14
 MOMENTUM_LOOKBACK = 3
 
+# EMA trend engine (P3): SMA_PERIOD di atas tetap dipertahankan untuk field
+# "sma" lama (kompatibilitas), tapi trend_score sekarang dihitung dari EMA,
+# bukan lagi cuma jarak close ke SMA. EMA_FAST/EMA_SLOW dipilih pasangan
+# umum (9/21) yang cukup responsif untuk timeframe 5m-1h tanpa terlalu
+# berisik. EMA_SLOPE_LOOKBACK menentukan seberapa jauh ke belakang
+# kemiringan EMA cepat diukur.
+EMA_FAST_PERIOD = 9
+EMA_SLOW_PERIOD = 21
+EMA_SLOPE_LOOKBACK = 5
+
+# RSI divergence & label momentum (P4).
+RSI_DIVERGENCE_MIN_RSI_DELTA = 3.0
+MOMENTUM_LABEL_LOOKBACK = 5
+MOMENTUM_LABEL_MIN_RSI_DELTA = 3.0
+
 ENTRY_TIMEFRAME_FOR_ATR = "15min"
 
 ATR_SL_MULTIPLIER = 1.5
@@ -327,6 +382,11 @@ SIDEWAYS_EFFICIENCY_THRESHOLD = 0.30
 SIDEWAYS_SLOPE_ATR_THRESHOLD = 0.15
 MIN_STRUCTURE_CONFIRMATION = 0.18
 MAX_SIDEWAYS_RATIO_FOR_SIGNAL = 0.60
+
+# Supply/Demand zone (P6): base sempit langsung diikuti candle impulsif.
+DEMAND_SUPPLY_LOOKBACK = 40
+DEMAND_SUPPLY_BASE_MAX_RANGE_ATR = 0.60
+DEMAND_SUPPLY_IMPULSE_MIN_BODY_ATR = 1.20
 
 # REVISI GATING (Stage 3):
 # Total bobot TIMEFRAME_WEIGHTS adalah 1.0+1.5+2.0+2.5 = 7.0. Ambang lama
@@ -399,6 +459,18 @@ class TimeframeResult:
     candlestick_score: float = 0.0
     sideways_efficiency: float = 0.0
     breakout_level: Optional[float] = None
+    ema_fast: Optional[float] = None
+    ema_slow: Optional[float] = None
+    ema_spread_score: float = 0.0
+    ema_slope_score: float = 0.0
+    rsi_divergence: Optional[str] = None
+    momentum_label: str = "Netral"
+    demand_zone: Optional[tuple[float, float]] = None
+    supply_zone: Optional[tuple[float, float]] = None
+    # Catatan: level psikologis TIDAK disimpan per-timeframe di sini karena
+    # levelnya bergantung pada harga saat ini (entry_price), bukan per-TF.
+    # Nilainya dihitung sekali di _build_market_analysis() dan disimpan di
+    # dict hasil analisis (key "near_psychological_level").
 
 
 @dataclass
@@ -650,6 +722,22 @@ def _safe_float(value: Any, field_name: str) -> float:
 def _decimal_places(symbol: str) -> int:
     """Jumlah desimal berdasarkan konfigurasi aset."""
     return get_asset_config(symbol).decimals
+
+
+def _nearest_psychological_level(
+    price: float,
+    increment: float,
+) -> Optional[float]:
+    """
+    Mencari level psikologis (angka bulat) terdekat dari harga saat ini.
+
+    increment 0 atau negatif berarti aset itu belum dikonfigurasi levelnya
+    (return None, bukan error, supaya aset baru tetap aman kalau lupa diisi).
+    """
+    if increment <= 0:
+        return None
+    return round(price / increment) * increment
+
 
 def _timeframe_bias(score: float) -> str:
     """
@@ -1018,6 +1106,18 @@ def _calculate_atr(
     ).mean()
 
 
+def _calculate_ema(
+    close: pd.Series,
+    period: int,
+) -> pd.Series:
+    """Menghitung Exponential Moving Average standar."""
+    return close.ewm(
+        span=period,
+        min_periods=period,
+        adjust=False,
+    ).mean()
+
+
 # =============================================================================
 # 6. PRICE ACTION, MARKET STRUCTURE, DAN CANDLESTICK
 # =============================================================================
@@ -1266,6 +1366,56 @@ def _detect_support_resistance(
         support_cluster["strength"] if support_cluster else 0,
         resistance_cluster["strength"] if resistance_cluster else 0,
     )
+
+
+def _detect_supply_demand_zones(
+    df: pd.DataFrame,
+    atr_value: float,
+) -> tuple[Optional[tuple[float, float]], Optional[tuple[float, float]]]:
+    """
+    Mendeteksi zona demand (base sebelum rally) & supply (base sebelum drop).
+
+    Pola yang dicari: satu candle "base" dengan range sempit (konsolidasi
+    -- jejak akumulasi/distribusi), langsung diikuti candle "impulsif"
+    dengan body besar yang membentuk breakout. Kalau candle impulsif itu
+    bullish, base di belakangnya jadi demand zone (area beli yang mendorong
+    rally). Kalau impulsif bearish, base-nya jadi supply zone. Zona yang
+    dipakai adalah kemunculan PALING BARU dari tiap jenis dalam lookback.
+
+    Ini pelengkap support/resistance dari cluster swing yang sudah ada,
+    bukan pengganti -- makanya bobot bonusnya di _score_timeframe lebih
+    kecil daripada bonus S/R utama.
+    """
+    lookback = min(DEMAND_SUPPLY_LOOKBACK, len(df) - 2)
+    if lookback < 3:
+        return None, None
+
+    segment = df.iloc[-lookback:].reset_index(drop=True)
+    demand_zone: Optional[tuple[float, float]] = None
+    supply_zone: Optional[tuple[float, float]] = None
+
+    for index in range(len(segment) - 1):
+        base = segment.iloc[index]
+        impulse = segment.iloc[index + 1]
+
+        base_range = float(base["high"] - base["low"])
+        impulse_body = abs(float(impulse["close"] - impulse["open"]))
+
+        is_tight_base = base_range <= atr_value * DEMAND_SUPPLY_BASE_MAX_RANGE_ATR
+        is_strong_impulse = (
+            impulse_body >= atr_value * DEMAND_SUPPLY_IMPULSE_MIN_BODY_ATR
+        )
+
+        if not (is_tight_base and is_strong_impulse):
+            continue
+
+        zone = (float(base["low"]), float(base["high"]))
+        if float(impulse["close"]) > float(impulse["open"]):
+            demand_zone = zone
+        else:
+            supply_zone = zone
+
+    return demand_zone, supply_zone
 
 
 def _detect_break_event(
@@ -1565,6 +1715,88 @@ def _detect_sideways_market(
     return sum(conditions) >= 3, float(np.clip(efficiency, 0.0, 1.0))
 
 
+def _detect_rsi_divergence(
+    swings: list[SwingPoint],
+    rsi_series: pd.Series,
+) -> Optional[str]:
+    """
+    Mendeteksi bullish/bearish divergence RSI (P4).
+
+    Memakai swing high/low yang sama dengan yang dipakai deteksi struktur,
+    supaya konsisten dan tidak menduplikasi logika pencarian swing.
+
+    Bullish divergence: harga bikin Lower Low, tapi RSI di titik itu malah
+    lebih tinggi dari RSI di Lower Low sebelumnya -- momentum turun sudah
+    melemah walau harga masih membuat titik rendah baru.
+
+    Bearish divergence: harga bikin Higher High, tapi RSI di titik itu malah
+    lebih rendah dari RSI di Higher High sebelumnya -- momentum naik sudah
+    melemah walau harga masih membuat titik tinggi baru.
+
+    Kalau kedua jenis divergence lolos syarat, dipakai yang paling baru
+    (index swing paling besar).
+    """
+    swing_lows = [item for item in swings if item.kind == "LOW"]
+    swing_highs = [item for item in swings if item.kind == "HIGH"]
+
+    candidates: list[tuple[int, str]] = []
+
+    if len(swing_lows) >= 2:
+        previous_low, latest_low = swing_lows[-2], swing_lows[-1]
+        price_lower_low = latest_low.price < previous_low.price
+        rsi_previous_low = float(rsi_series.iloc[previous_low.index])
+        rsi_latest_low = float(rsi_series.iloc[latest_low.index])
+        rsi_higher_low = (
+            rsi_latest_low - rsi_previous_low
+        ) >= RSI_DIVERGENCE_MIN_RSI_DELTA
+
+        if price_lower_low and rsi_higher_low:
+            candidates.append((latest_low.index, "BULLISH"))
+
+    if len(swing_highs) >= 2:
+        previous_high, latest_high = swing_highs[-2], swing_highs[-1]
+        price_higher_high = latest_high.price > previous_high.price
+        rsi_previous_high = float(rsi_series.iloc[previous_high.index])
+        rsi_latest_high = float(rsi_series.iloc[latest_high.index])
+        rsi_lower_high = (
+            rsi_previous_high - rsi_latest_high
+        ) >= RSI_DIVERGENCE_MIN_RSI_DELTA
+
+        if price_higher_high and rsi_lower_high:
+            candidates.append((latest_high.index, "BEARISH"))
+
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def _classify_momentum_label(
+    rsi_series: pd.Series,
+    lookback: int = MOMENTUM_LABEL_LOOKBACK,
+) -> str:
+    """
+    Melabeli momentum sebagai Menguat, Melemah, atau Netral.
+
+    Berbeda dari rsi_score (yang menilai LEVEL RSI sekarang), ini menilai
+    ARAH PERUBAHAN RSI beberapa candle terakhir -- RSI 65 yang naik dari 55
+    itu "Menguat", sedangkan RSI 65 yang turun dari 75 itu "Melemah", walau
+    level RSI-nya sama-sama masih di atas 50.
+    """
+    if len(rsi_series) <= lookback:
+        return "Netral"
+
+    current_rsi = float(rsi_series.iloc[-1])
+    prior_rsi = float(rsi_series.iloc[-1 - lookback])
+    delta = current_rsi - prior_rsi
+
+    if delta >= MOMENTUM_LABEL_MIN_RSI_DELTA:
+        return "Menguat"
+    if delta <= -MOMENTUM_LABEL_MIN_RSI_DELTA:
+        return "Melemah"
+    return "Netral"
+
+
 def _derive_trend_label(
     sideways: bool,
     structure_score: float,
@@ -1626,8 +1858,10 @@ def _score_timeframe(
             BB_PERIOD,
             ATR_PERIOD,
             SIDEWAYS_LOOKBACK,
+            EMA_SLOW_PERIOD,
         )
         + MOMENTUM_LOOKBACK
+        + EMA_SLOPE_LOOKBACK
         + (SWING_WINDOW * 2)
         + 2
     )
@@ -1647,12 +1881,20 @@ def _score_timeframe(
         window=SMA_PERIOD,
         min_periods=SMA_PERIOD,
     ).mean()
+    ema_fast_series = _calculate_ema(close, EMA_FAST_PERIOD)
+    ema_slow_series = _calculate_ema(close, EMA_SLOW_PERIOD)
     bb_upper, bb_middle, bb_lower = _calculate_bollinger(close)
     atr_series = _calculate_atr(df)
 
     last_close = _safe_float(close.iloc[-1], "close")
     last_rsi = _safe_float(rsi_series.iloc[-1], "RSI")
     last_sma = _safe_float(sma_series.iloc[-1], "SMA")
+    last_ema_fast = _safe_float(ema_fast_series.iloc[-1], "EMA cepat")
+    last_ema_slow = _safe_float(ema_slow_series.iloc[-1], "EMA lambat")
+    prior_ema_fast = _safe_float(
+        ema_fast_series.iloc[-1 - EMA_SLOPE_LOOKBACK],
+        "EMA cepat sebelumnya",
+    )
     last_bb_upper = _safe_float(bb_upper.iloc[-1], "Bollinger upper")
     last_bb_lower = _safe_float(bb_lower.iloc[-1], "Bollinger lower")
     last_bb_middle = _safe_float(bb_middle.iloc[-1], "Bollinger middle")
@@ -1662,8 +1904,41 @@ def _score_timeframe(
         logger.warning("ATR tidak valid | tf=%s | atr=%s", timeframe, last_atr)
         return None
 
-    trend_distance = (last_close - last_sma) / last_atr
-    trend_score = float(np.clip(trend_distance / 1.5, -1.0, 1.0))
+    # ------------------------------------------------------------------
+    # P3 -- EMA trend engine. Sebelumnya trend_score cuma dari jarak close
+    # ke SMA20 (satu ukuran, tidak melihat kemiringan atau crossing sama
+    # sekali). Sekarang trend_score gabungan tiga ukuran EMA:
+    #   1) posisi harga relatif EMA lambat (bobot dominan, mirip logika lama
+    #      tapi pakai EMA yang lebih responsif daripada SMA)
+    #   2) jarak antar EMA cepat & lambat (makin lebar makin kuat trennya --
+    #      ini "kekuatan trend" dan otomatis mencakup info crossing, karena
+    #      spread mendekati nol saat EMA baru saja crossing)
+    #   3) kemiringan EMA cepat beberapa candle terakhir (arah & kecepatan
+    #      pergerakan EMA itu sendiri, bukan cuma level statis)
+    # ------------------------------------------------------------------
+    ema_price_position_score = float(
+        np.clip((last_close - last_ema_slow) / last_atr / 1.5, -1.0, 1.0)
+    )
+    ema_spread_score = float(
+        np.clip((last_ema_fast - last_ema_slow) / last_atr, -1.0, 1.0)
+    )
+    ema_slope_score = float(
+        np.clip(
+            (last_ema_fast - prior_ema_fast)
+            / (last_atr * max(EMA_SLOPE_LOOKBACK, 1)),
+            -1.0,
+            1.0,
+        )
+    )
+    trend_score = float(
+        np.clip(
+            (0.45 * ema_price_position_score)
+            + (0.35 * ema_spread_score)
+            + (0.20 * ema_slope_score),
+            -1.0,
+            1.0,
+        )
+    )
     rsi_score = float(np.clip((last_rsi - 50.0) / 20.0, -1.0, 1.0))
 
     half_band_width = max(
@@ -1693,6 +1968,20 @@ def _score_timeframe(
 
     swings = _detect_swings(df)
     structure = _classify_market_structure(swings, last_atr)
+
+    # ------------------------------------------------------------------
+    # P4 -- RSI divergence & label momentum. Divergence dipakai untuk
+    # menyesuaikan rsi_score (bukan komponen skor terpisah baru, supaya
+    # bobot total_score yang sudah ada tidak perlu dirombak): divergence
+    # searah menambah keyakinan, divergence berlawanan arah mengurangi.
+    # ------------------------------------------------------------------
+    rsi_divergence = _detect_rsi_divergence(swings, rsi_series)
+    momentum_label = _classify_momentum_label(rsi_series)
+
+    if rsi_divergence == "BULLISH":
+        rsi_score = float(np.clip(rsi_score + 0.30, -1.0, 1.0))
+    elif rsi_divergence == "BEARISH":
+        rsi_score = float(np.clip(rsi_score - 0.30, -1.0, 1.0))
 
     support_level, resistance_level, support_strength, resistance_strength = (
         _detect_support_resistance(
@@ -1774,6 +2063,25 @@ def _score_timeframe(
             0.30 if candlestick_score <= 0 else 0.12
         )
 
+    # P6 -- Supply/Demand zone: bonus lebih kecil daripada S/R swing biasa
+    # (0.20 vs 0.30) karena ini pola tambahan/konfirmasi, bukan pengganti
+    # support/resistance utama yang sudah dihitung dari cluster swing.
+    demand_zone, supply_zone = _detect_supply_demand_zones(df, last_atr)
+
+    if demand_zone is not None and (
+        demand_zone[0] - near_distance
+        <= last_close
+        <= demand_zone[1] + near_distance
+    ):
+        support_resistance_score += 0.20
+
+    if supply_zone is not None and (
+        supply_zone[0] - near_distance
+        <= last_close
+        <= supply_zone[1] + near_distance
+    ):
+        support_resistance_score -= 0.20
+
     support_resistance_score = float(
         np.clip(support_resistance_score, -1.0, 1.0)
     )
@@ -1793,6 +2101,36 @@ def _score_timeframe(
         choch=choch,
     )
 
+    # =========================================================================
+    # P8 -- Peta bobot total_score (skor arah per timeframe, skala -1..1).
+    # Dipetakan ke kategori yang diminta di instruksi proyek supaya mudah
+    # ditelusuri, walau angkanya tidak persis sama dengan usulan awal
+    # (instruksi proyek mengizinkan pembobotan ditentukan sendiri):
+    #   Trend (EMA)          24% -> trend_score
+    #   Market Structure     24% -> structure_score (HH/HL/LH/LL + BOS/CHoCH)
+    #   Momentum             12% -> momentum_score
+    #                        +14% -> rsi_score (bagian dari "Momentum" secara
+    #                                konsep, dipisah historically dari RSI 14
+    #                                klasik; termasuk penyesuaian divergence)
+    #   Support/Resistance    9% -> support_resistance_score (S/R + supply/
+    #                                demand zone P6, BOS/CHoCH, false breakout)
+    #   Candlestick           7% -> candlestick_score
+    #   Bollinger Bands      10% -> bb_score (pelengkap volatilitas, di luar
+    #                                7 kategori asli tapi dipertahankan karena
+    #                                sudah ada sebelumnya dan berguna)
+    #   ATR                   -   dipakai untuk SL/TP & normalisasi skor lain,
+    #                                bukan skor arah tersendiri (ATR memang
+    #                                bukan indikator arah, jadi wajar tidak
+    #                                punya slot bobot sendiri di sini)
+    #   Volume                0% -> SENGAJA tidak diberi bobot (lihat P5:
+    #                                Twelve Data tidak menyediakan volume
+    #                                riil untuk forex/XAU spot). Bobotnya
+    #                                dialihkan proporsional ke Trend &
+    #                                Structure, dua faktor dengan data paling
+    #                                reliable.
+    # Total = 100%. Lihat juga _calculate_confidence_score() untuk lapisan
+    # bobot KEDUA (confidence, berbeda dari total_score ini).
+    # =========================================================================
     total_score = (
         (0.24 * trend_score)
         + (0.14 * rsi_score)
@@ -1847,6 +2185,14 @@ def _score_timeframe(
         candlestick_score=candlestick_score,
         sideways_efficiency=sideways_efficiency,
         breakout_level=breakout_level,
+        ema_fast=last_ema_fast,
+        ema_slow=last_ema_slow,
+        ema_spread_score=ema_spread_score,
+        ema_slope_score=ema_slope_score,
+        rsi_divergence=rsi_divergence,
+        momentum_label=momentum_label,
+        demand_zone=demand_zone,
+        supply_zone=supply_zone,
     )
 
 
@@ -2119,6 +2465,54 @@ def _calculate_confidence_score(
     penalti proporsional saat benar-benar berlawanan (counter_trend_penalty).
     Sinyal yang sangat kuat di timeframe kecil-menengah tidak lagi otomatis
     gugur hanya karena H1/H4 sedang diklasifikasikan Sideways.
+
+    =========================================================================
+    P8 -- Peta bobot confidence_pct (lapisan bobot KEDUA, beda dari
+    total_score di _score_timeframe()). total_score menilai ARAH per
+    timeframe; confidence_pct menilai KUALITAS/KELAYAKAN sinyal gabungan
+    secara keseluruhan -- karena itu wajar kalau bobot & komponennya beda.
+
+    Komponen positif (menjumlah ke 100%):
+      normalized_strength    28% -> seberapa kuat combined_score (gabungan
+                                     seluruh timeframe) dibanding target 0.60.
+                                     Proxy gabungan Trend + Momentum + SR +
+                                     Candlestick, karena combined_score itu
+                                     sendiri sudah hasil agregasi total_score
+                                     per timeframe.
+      directional_agreement  18% -> berapa persen timeframe yang searah
+                                     (konfirmasi lintas-timeframe, bagian
+                                     dari kategori Market Structure).
+      coverage_ratio         12% -> berapa lengkap data timeframe yang
+                                     berhasil diambil (kualitas data, bukan
+                                     sinyal arah, tapi tetap penting supaya
+                                     confidence tidak overclaim saat data
+                                     timeframe banyak yang hilang).
+      structure_confirmation 15% -> HH/HL/LH/LL, BOS, CHoCH (Market
+                                     Structure).
+      pattern_confirmation    7% -> candlestick pattern (Candlestick).
+      trend_alignment_score  20% -> keselarasan trend H1/H4 (Trend, EMA).
+      -------------------------------------------------------------
+      Total                 100%
+
+    Penalti proporsional (mengalikan confidence, bukan menjumlah/mengurangi
+    dari 100 -- supaya tidak bisa menjadi negatif dan tetap proporsional):
+      sideways_ratio               20% dari penalty_multiplier -> menghukum
+                                    saat mayoritas timeframe sideways
+                                    (Market Structure lemah).
+      false_breakout_against_ratio 30% dari penalty_multiplier -> penalti
+                                    terbesar karena false breakout yang
+                                    melawan arah adalah sinyal bahaya paling
+                                    konkret (S/R & Market Structure palsu).
+      counter_trend_penalty        25% dari penalty_multiplier -> menghukum
+                                    saat melawan trend besar H1/H4 (Trend).
+      penalty_multiplier dibatasi minimum 0.30 (bukan 0) supaya sinyal yang
+      tetap valid secara teknikal tidak langsung hangus ke confidence 0
+      hanya karena satu faktor penalti besar; ini konsisten dengan filosofi
+      "berani memberi sinyal kalau memang layak" (poin #10 instruksi).
+
+    Volume: sama seperti total_score, confidence_pct juga sengaja TIDAK
+    memberi bobot untuk volume (lihat P5 & catatan di _score_timeframe()).
+    =========================================================================
     """
     normalized_strength = min(abs(combined_score) / 0.60, 1.0)
 
@@ -2297,6 +2691,12 @@ def _build_reasons(
             if pattern_supports and result.candlestick_patterns:
                 reasons.append(
                     f"Pola {result.candlestick_patterns[0]} mendukung pada {label}."
+                )
+
+            if result.rsi_divergence == target_direction:
+                reasons.append(
+                    f"{target_direction.title()} divergence RSI terdeteksi "
+                    f"pada {label}, momentum {result.momentum_label.lower()}."
                 )
 
             if len(reasons) >= 5:
@@ -2483,6 +2883,7 @@ def _build_indicator_checklist(
 # =============================================================================
 async def _build_market_analysis(
     symbol: str = DEFAULT_SYMBOL,
+    psychological_increment: float = 0.0,
 ) -> dict:
     """Mengambil dan menganalisis market secara multi-timeframe."""
     if not TWELVE_DATA_API_KEY:
@@ -2639,6 +3040,23 @@ async def _build_market_analysis(
         reference_result.close,
     )
     atr_value = reference_result.atr
+
+    # P6 -- level psikologis. Dihitung sekali di sini (bukan per timeframe
+    # seperti supply/demand zone) karena butuh konfigurasi per-aset
+    # (psychological_increment) yang baru tersedia di level fungsi ini,
+    # bukan di _score_timeframe yang sengaja dibuat asset-agnostic. Ini
+    # informasi pendukung untuk transparansi alasan (item 12), bukan
+    # komponen skor baru -- supaya tidak menambah risiko di pipeline
+    # scoring inti yang sudah divalidasi.
+    nearest_psychological_level = _nearest_psychological_level(
+        entry_price,
+        psychological_increment,
+    )
+    near_psychological_level: Optional[float] = None
+    if nearest_psychological_level is not None:
+        psychological_distance = abs(entry_price - nearest_psychological_level)
+        if psychological_distance <= atr_value * NEAR_LEVEL_ATR_MULTIPLIER:
+            near_psychological_level = nearest_psychological_level
 
     prospective_sl: Optional[float] = None
     prospective_tp1: Optional[float] = None
@@ -2863,6 +3281,9 @@ async def _build_market_analysis(
         "counter_trend_penalty": round(counter_trend_penalty, 2),
         "min_risk_reward_ratio": MIN_RISK_REWARD_RATIO,
         "risk_reward_ok": enough_risk_reward,
+        "near_psychological_level": near_psychological_level,
+        "demand_zone": reference_result.demand_zone,
+        "supply_zone": reference_result.supply_zone,
         "confidence_note": (
             "Confidence Score adalah skor konfluensi internal dan "
             "belum menjadi probabilitas kemenangan."
@@ -2979,7 +3400,10 @@ async def get_market_data(
             return cached_analysis
 
         provider_symbol = await _resolve_provider_symbol(asset)
-        analysis = await _build_market_analysis(provider_symbol)
+        analysis = await _build_market_analysis(
+            provider_symbol,
+            psychological_increment=asset.psychological_increment,
+        )
 
         analysis["symbol"] = canonical_symbol
         analysis["provider_symbol"] = provider_symbol
@@ -3059,11 +3483,14 @@ def generate_signal_message(analysis: dict) -> str:
             event_labels.append("Sideways")
         if result.false_breakout:
             event_labels.append(f"False BO {result.false_breakout.title()}")
+        if result.rsi_divergence:
+            event_labels.append(f"Divergence {result.rsi_divergence.title()}")
 
         event_text = f" | {', '.join(event_labels)}" if event_labels else ""
         lines.append(
             f"• *{label}*: {bias} | {result.score:+.2f} | "
-            f"RSI {result.rsi:.1f} | {result.market_structure}{event_text}"
+            f"RSI {result.rsi:.1f} ({result.momentum_label})"
+            f" | {result.market_structure}{event_text}"
         )
 
     reference_timeframe = analysis.get(
@@ -3089,6 +3516,25 @@ def generate_signal_message(analysis: dict) -> str:
             "• Pola candle: "
             + (", ".join(patterns[:3]) if patterns else "tidak ada pola kuat")
         )
+
+        demand_zone = analysis.get("demand_zone")
+        if demand_zone:
+            lines.append(
+                f"• Demand zone: {demand_zone[0]:.{decimals}f} - "
+                f"{demand_zone[1]:.{decimals}f}"
+            )
+        supply_zone = analysis.get("supply_zone")
+        if supply_zone:
+            lines.append(
+                f"• Supply zone: {supply_zone[0]:.{decimals}f} - "
+                f"{supply_zone[1]:.{decimals}f}"
+            )
+        near_psychological_level = analysis.get("near_psychological_level")
+        if near_psychological_level is not None:
+            lines.append(
+                "• Harga dekat area psikologis: "
+                f"{near_psychological_level:.{decimals}f}"
+            )
 
     lines.append("")
     if signal in {"BUY", "SELL"}:
@@ -3165,96 +3611,3 @@ def generate_signal_message(analysis: dict) -> str:
         total += addition
     safe_lines.append("_Pesan dipadatkan karena batas Telegram._")
     return "\n".join(safe_lines)
-
-# =============================================================================
-# 10. CALLBACK HANDLER LEGACY
-# =============================================================================
-async def button(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    """
-    Handler legacy untuk tombol analyze_xauusd.
-
-    Fungsi ini dipertahankan agar integrasi lama tetap dapat digunakan.
-    Pada tahap berikutnya, tes_bot.py akan menjadi pemilik alur Telegram.
-    """
-    query = update.callback_query
-
-    if query is None:
-        return
-
-    try:
-        await query.answer()
-    except Exception:
-        logger.exception(
-            "Gagal menjawab callback Telegram."
-        )
-        return
-
-    if query.data != "analyze_xauusd":
-        return
-
-    refresh_keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "🔄 Refresh Analisa",
-                    callback_data="analyze_xauusd",
-                )
-            ]
-        ]
-    )
-
-    try:
-        await query.edit_message_text(
-            "⏳ Mengambil dan menganalisis data "
-            "4 timeframe (5m/15m/30m/1h)..."
-        )
-    except Exception:
-        logger.exception(
-            "Gagal menampilkan pesan proses analisis."
-        )
-        return
-
-    try:
-        analysis = await get_market_data(DEFAULT_SYMBOL)
-        message = generate_signal_message(analysis)
-
-        await query.edit_message_text(
-            message,
-            parse_mode="Markdown",
-            reply_markup=refresh_keyboard,
-        )
-
-    except RuntimeError as exc:
-        logger.warning(
-            "Analisis pasar gagal | error=%s",
-            exc,
-        )
-
-        try:
-            await query.edit_message_text(
-                f"❌ Gagal mengambil data pasar: {exc}",
-                reply_markup=refresh_keyboard,
-            )
-        except Exception:
-            logger.exception(
-                "Gagal mengirim pesan RuntimeError."
-            )
-
-    except Exception:
-        logger.exception(
-            "Error tak terduga pada button handler."
-        )
-
-        try:
-            await query.edit_message_text(
-                "❌ Terjadi kesalahan tak terduga saat analisis. "
-                "Silakan coba lagi beberapa saat.",
-                reply_markup=refresh_keyboard,
-            )
-        except Exception:
-            logger.exception(
-                "Gagal mengirim pesan error tak terduga."
-            )
