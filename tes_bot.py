@@ -257,6 +257,7 @@ def _format_tracker_stats(
     tp3_hits = int(summary.get("tp3_hits") or 0)
     direct_sl = int(summary.get("direct_sl") or 0)
     sl_after_tp = int(summary.get("sl_after_tp") or 0)
+    breakeven_after_tp = int(summary.get("breakeven_after_tp") or 0)
     expired = int(summary.get("expired") or 0)
     win_rate_closed = float(summary.get("win_rate_closed_pct") or 0.0)
     tp1_hit_rate = float(summary.get("tp1_hit_rate_pct") or 0.0)
@@ -278,6 +279,7 @@ def _format_tracker_stats(
         f"TP3: {tp3_hits}",
         f"SL langsung: {direct_sl}",
         f"SL setelah TP: {sl_after_tp}",
+        f"Breakeven (setelah TP): {breakeven_after_tp}",
         f"Expired: {expired}",
         "",
         f"Win rate (selesai): {win_rate_closed:.1f}% ({completed} trade)",
@@ -302,8 +304,11 @@ def _format_tracker_stats(
             "",
             "Catatan: TP dan SL pada candle yang sama dihitung SL dahulu.",
             "Win rate & Sentuh TP1 hanya dari trade yang SUDAH SELESAI. "
-            "SL setelah TP tetap dihitung KALAH "
-            "(bot tidak memindahkan SL ke breakeven / partial close).",
+            "Setelah TP1 tersentuh, SL dipindah ke entry (breakeven) — trade "
+            "yang lalu berbalik ditutup impas 0R dan dicatat sebagai "
+            "Breakeven, bukan kalah. Win rate hanya menghitung trade yang "
+            "ditutup dalam profit (breakeven tidak dihitung menang maupun "
+            "kalah).",
         ]
     )
     return "\n".join(lines)
