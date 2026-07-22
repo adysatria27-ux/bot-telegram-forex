@@ -404,6 +404,55 @@ DEMAND_SUPPLY_IMPULSE_MIN_BODY_ATR = 1.20
 MAX_FALSE_BREAKOUT_AGAINST_RATIO = 0.50
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    """Membaca environment variable boolean secara toleran."""
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    """Membaca environment variable float secara toleran."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Env %s bukan angka valid: %s", name, raw)
+        return default
+
+
+# =============================================================================
+# P2 -- Filter overextension / late-entry.
+# Hipotesis dari data /stats real: sinyal confidence sangat tinggi cenderung
+# muncul saat semua indikator sudah searah sempurna = tren sudah matang =
+# entry telat/mengejar harga, dan justru bucket confidence tertinggi yang
+# paling banyak kalah (90-100 kumulatif 0/3 di beberapa snapshot). Filter ini
+# mengukur seberapa 'meregang' harga (jarak ke EMA dalam ATR + RSI ekstrem
+# searah sinyal) dan menguranginya dari confidence secara PROPORSIONAL --
+# bukan veto keras, konsisten dengan arsitektur penalti yang sudah ada.
+# Sengaja dibuat ringan & reversibel: bobotnya bisa disetel/dimatikan lewat
+# environment variable tanpa ubah kode, supaya bisa dikalibrasi dari data.
+OVEREXTENSION_PENALTY_ENABLED = _env_flag(
+    "OVEREXTENSION_PENALTY_ENABLED", True
+)
+OVEREXTENSION_PENALTY_WEIGHT = _env_float(
+    "OVEREXTENSION_PENALTY_WEIGHT", 0.15
+)
+# Jarak harga ke EMA lambat (satuan ATR): di bawah START masih sehat (0),
+# naik linear sampai penuh (1) di FULL.
+OVEREXTENSION_EMA_ATR_START = 1.5
+OVEREXTENSION_EMA_ATR_FULL = 3.0
+# RSI yang sudah ekstrem searah sinyal.
+OVEREXTENSION_RSI_BUY = 70.0
+OVEREXTENSION_RSI_SELL = 30.0
+_EFFECTIVE_OVEREXTENSION_WEIGHT = (
+    OVEREXTENSION_PENALTY_WEIGHT if OVEREXTENSION_PENALTY_ENABLED else 0.0
+)
+
+
 @dataclass(frozen=True)
 class SwingPoint:
     """Swing high atau swing low yang sudah terkonfirmasi."""
@@ -2440,6 +2489,82 @@ def _calculate_false_breakout_against_ratio(
     return against_weight / total_weight
 
 
+def _timeframe_overextension(
+    result: "TimeframeResult",
+    candidate_signal: str,
+) -> float:
+    """
+    Skor 0..1 seberapa 'telat/meregang' harga untuk arah calon sinyal (P2).
+
+    Dua proksi 'kejauhan', dipakai nilai TERBESAR (salah satu cukup):
+      1) Jarak harga ke EMA lambat dalam satuan ATR, HANYA yang searah
+         sinyal (harga jauh DI ATAS EMA untuk BUY, jauh DI BAWAH untuk
+         SELL). Di bawah START ATR dianggap sehat (0), naik linear sampai
+         penuh (1) di FULL ATR.
+      2) RSI yang sudah ekstrem searah sinyal (>70 BUY, <30 SELL).
+
+    Tidak pernah memveto sinyal; hanya jadi penalti proporsional di
+    confidence (lihat _calculate_confidence_score).
+    """
+    if candidate_signal not in {"BUY", "SELL"}:
+        return 0.0
+
+    atr = result.atr
+    if atr is None or atr <= 0:
+        return 0.0
+
+    ema_component = 0.0
+    if result.ema_slow is not None:
+        distance_atr = (result.close - result.ema_slow) / atr
+        directional = (
+            distance_atr if candidate_signal == "BUY" else -distance_atr
+        )
+        if directional > OVEREXTENSION_EMA_ATR_START:
+            span = max(
+                OVEREXTENSION_EMA_ATR_FULL - OVEREXTENSION_EMA_ATR_START,
+                np.finfo(float).eps,
+            )
+            ema_component = (
+                directional - OVEREXTENSION_EMA_ATR_START
+            ) / span
+
+    rsi_component = 0.0
+    rsi_value = result.rsi
+    if candidate_signal == "BUY" and rsi_value > OVEREXTENSION_RSI_BUY:
+        rsi_component = (rsi_value - OVEREXTENSION_RSI_BUY) / max(
+            100.0 - OVEREXTENSION_RSI_BUY, np.finfo(float).eps
+        )
+    elif candidate_signal == "SELL" and rsi_value < OVEREXTENSION_RSI_SELL:
+        rsi_component = (OVEREXTENSION_RSI_SELL - rsi_value) / max(
+            OVEREXTENSION_RSI_SELL, np.finfo(float).eps
+        )
+
+    return float(np.clip(max(ema_component, rsi_component), 0.0, 1.0))
+
+
+def _calculate_overextension_ratio(
+    timeframe_results: dict[str, "TimeframeResult"],
+    candidate_signal: str,
+) -> float:
+    """Rata-rata tertimbang overextension seluruh timeframe (P2)."""
+    if candidate_signal not in {"BUY", "SELL"}:
+        return 0.0
+
+    total_weight = sum(
+        TIMEFRAME_WEIGHTS[timeframe]
+        for timeframe in timeframe_results
+    )
+    if total_weight <= 0:
+        return 0.0
+
+    weighted = sum(
+        TIMEFRAME_WEIGHTS[timeframe]
+        * _timeframe_overextension(result, candidate_signal)
+        for timeframe, result in timeframe_results.items()
+    )
+    return float(np.clip(weighted / total_weight, 0.0, 1.0))
+
+
 def _calculate_confidence_score(
     combined_score: float,
     directional_agreement: float,
@@ -2450,6 +2575,7 @@ def _calculate_confidence_score(
     sideways_ratio: float = 0.0,
     false_breakout_against_ratio: float = 0.0,
     counter_trend_penalty: float = 0.0,
+    overextension_ratio: float = 0.0,
 ) -> float:
     """
     Menghitung Confidence Score konfluensi internal.
@@ -2535,6 +2661,12 @@ def _calculate_confidence_score(
             )
         )
         - (0.25 * float(np.clip(counter_trend_penalty, 0.0, 1.0)))
+        # P2 -- penalti overextension/late-entry (ringan & reversibel;
+        # bobot & on/off lewat env). Tetap dibatasi floor 0.30 di bawah.
+        - (
+            _EFFECTIVE_OVEREXTENSION_WEIGHT
+            * float(np.clip(overextension_ratio, 0.0, 1.0))
+        )
     )
 
     confidence *= max(0.30, penalty_multiplier)
@@ -2595,6 +2727,7 @@ def _build_reasons(
     false_breakout_against_ratio: float = 0.0,
     risk_reward_tp1: Optional[float] = None,
     counter_trend_penalty: float = 0.0,
+    overextension_ratio: float = 0.0,
     risk_reward_ok: bool = True,
 ) -> list[str]:
     """Membuat alasan analisis yang mudah dipahami manusia."""
@@ -2642,6 +2775,11 @@ def _build_reasons(
         if counter_trend_penalty >= 0.35:
             reasons.append(
                 "Calon sinyal melawan trend kuat di timeframe besar (H1/H4)."
+            )
+        if overextension_ratio >= 0.50:
+            reasons.append(
+                "Harga sudah terlalu jauh dari EMA / RSI ekstrem "
+                "(indikasi entry telat) -- menunggu harga lebih sehat."
             )
         if not reasons:
             reasons.append(
@@ -2719,6 +2857,11 @@ def _build_reasons(
             reasons.append(
                 "Catatan: sinyal ini melawan sebagian trend timeframe besar, "
                 "gunakan manajemen risiko lebih ketat."
+            )
+        if overextension_ratio >= 0.40:
+            reasons.append(
+                "Catatan: harga sudah cukup jauh dari EMA (kemungkinan entry "
+                "telat) -- pertimbangkan tunggu retrace atau perketat risiko."
             )
 
     if missing_timeframes:
@@ -3010,6 +3153,10 @@ async def _build_market_analysis(
         higher_timeframe_score,
         candidate_signal,
     )
+    overextension_ratio = _calculate_overextension_ratio(
+        timeframe_results,
+        candidate_signal,
+    )
 
     confidence_pct = _calculate_confidence_score(
         combined_score,
@@ -3021,6 +3168,7 @@ async def _build_market_analysis(
         sideways_ratio,
         false_breakout_against_ratio,
         counter_trend_penalty,
+        overextension_ratio,
     )
 
     # ------------------------------------------------------------------
@@ -3197,13 +3345,14 @@ async def _build_market_analysis(
         false_breakout_against_ratio=false_breakout_against_ratio,
         risk_reward_tp1=risk_reward_tp1,
         counter_trend_penalty=counter_trend_penalty,
+        overextension_ratio=overextension_ratio,
         risk_reward_ok=enough_risk_reward,
     )
 
     logger.info(
         "Analisis selesai | symbol=%s | signal=%s | score=%.3f | "
         "confidence=%.1f | structure=%.2f | pattern=%.2f | "
-        "sideways=%.2f | false_breakout=%.2f | trend=%s",
+        "sideways=%.2f | false_breakout=%.2f | overext=%.2f | trend=%s",
         symbol,
         signal,
         combined_score,
@@ -3212,6 +3361,7 @@ async def _build_market_analysis(
         pattern_confirmation,
         sideways_ratio,
         false_breakout_against_ratio,
+        overextension_ratio,
         trend,
     )
 
@@ -3276,6 +3426,7 @@ async def _build_market_analysis(
             false_breakout_against_ratio * 100,
             1,
         ),
+        "overextension_ratio_pct": round(overextension_ratio * 100, 1),
         "false_breakout_filter_passed": false_breakout_filter_passed,
         "trend_alignment_score": round(trend_alignment_score, 2),
         "counter_trend_penalty": round(counter_trend_penalty, 2),
