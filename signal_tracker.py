@@ -18,6 +18,12 @@ Persistensi Railway:
 
 Aturan konservatif:
     Jika SL dan TP tersentuh pada candle yang sama, SL dianggap tersentuh dahulu.
+
+Manajemen trade -- Breakeven setelah TP1:
+    Setelah TP1 tersentuh, SL efektif dipindah ke harga entry. Trade yang
+    sudah bergerak ke arah kita tidak lagi bisa berbalik menjadi kerugian
+    penuh di SL awal; paling buruk ditutup impas (0R) dan dicatat sebagai
+    BREAKEVEN_AFTER_TPn. Bisa dimatikan lewat env BREAKEVEN_AFTER_TP1=0.
 ================================================================================
 """
 
@@ -45,6 +51,23 @@ MAX_RECENT_SIGNAL_LIMIT = 50
 
 _SCHEMA_VERSION = 1
 _DATABASE_PATH: Optional[Path] = None
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Membaca environment variable boolean secara toleran."""
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+# Manajemen trade -- Breakeven setelah TP1.
+# Setelah TP1 tersentuh, SL efektif dipindah ke harga entry sehingga trade
+# yang sudah bergerak ke arah kita tidak lagi bisa berbalik menjadi kerugian
+# penuh di SL awal; paling buruk ditutup impas (0R). Perilaku ini bisa
+# dimatikan lewat environment variable BREAKEVEN_AFTER_TP1=0 bila ingin
+# kembali ke perilaku lama (SL awal tetap sampai trade selesai).
+BREAKEVEN_AFTER_TP1 = _env_flag("BREAKEVEN_AFTER_TP1", True)
 
 
 def _utc_now() -> datetime:
@@ -653,6 +676,20 @@ def _closed_outcome_after_sl(max_tp_hit: int) -> str:
     return f"SL_AFTER_TP{max_tp_hit}"
 
 
+def _breakeven_outcome(max_tp_hit: int) -> str:
+    """Nama outcome saat SL breakeven (di entry) tersentuh setelah TP.
+
+    Berbeda dari SL_AFTER_TP: ini BUKAN kerugian penuh, melainkan trade yang
+    ditutup impas (0R) karena SL sudah dipindah ke entry setelah TP1. Dengan
+    max_tp_hit selalu >= 1 saat breakeven aktif, nama outcome selalu
+    BREAKEVEN_AFTER_TPn (fallback "SL" hanya jaga-jaga jika dipanggil salah).
+    """
+    if max_tp_hit <= 0:
+        return "SL"
+
+    return f"BREAKEVEN_AFTER_TP{max_tp_hit}"
+
+
 def _expired_outcome(max_tp_hit: int) -> str:
     """Nama outcome saat sinyal kedaluwarsa."""
     if max_tp_hit <= 0:
@@ -748,12 +785,28 @@ def update_open_signals(
                 mae = max(mae, adverse)
                 latest_checked = _to_iso(candle["datetime"])
 
+                # Breakeven setelah TP1: kalau TP1 sudah tersentuh di candle
+                # SEBELUMNYA (max_tp_hit >= 1), SL efektif dipindah ke entry.
+                # SL awal hanya berlaku selama trade belum menyentuh TP1.
+                # Catatan urutan: pada candle di mana TP1 PERTAMA kali kena,
+                # max_tp_hit di titik ini masih nilai dari candle sebelumnya
+                # (0), sehingga SL awal tetap dipakai untuk candle itu --
+                # konservatif dan menghindari asumsi urutan intrabar.
+                breakeven_active = (
+                    BREAKEVEN_AFTER_TP1 and max_tp_hit >= 1
+                )
+                effective_sl = entry if breakeven_active else sl
+
                 # Konservatif: SL diperiksa sebelum TP di candle yang sama.
-                if _sl_hit_for_candle(signal, candle, sl):
+                if _sl_hit_for_candle(signal, candle, effective_sl):
                     status = "CLOSED"
-                    outcome = _closed_outcome_after_sl(max_tp_hit)
+                    if breakeven_active:
+                        outcome = _breakeven_outcome(max_tp_hit)
+                        outcome_price = entry
+                    else:
+                        outcome = _closed_outcome_after_sl(max_tp_hit)
+                        outcome_price = sl
                     outcome_at = latest_checked
-                    outcome_price = sl
                     break
 
                 candle_tp_hit = _tp_hit_for_candle(
@@ -929,6 +982,13 @@ def get_performance_summary(days: int = 30) -> dict[str, Any]:
                     AS direct_sl,
                 SUM(CASE WHEN outcome LIKE 'SL_AFTER_TP%' THEN 1 ELSE 0 END)
                     AS sl_after_tp,
+                SUM(
+                    CASE
+                        WHEN outcome LIKE 'BREAKEVEN_AFTER_TP%'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS breakeven_after_tp,
                 SUM(CASE WHEN outcome LIKE '%EXPIRED%' THEN 1 ELSE 0 END)
                     AS expired,
                 SUM(
@@ -1021,10 +1081,9 @@ def get_performance_summary(days: int = 30) -> dict[str, Any]:
     # win_rate_closed_pct: win rate FINAL yang benar-benar terealisasi.
     # Sebuah trade dihitung MENANG hanya jika harga penutupannya (outcome_price)
     # berada di sisi profit relatif terhadap entry (BUY: close > entry,
-    # SELL: close < entry). Karena tracker TIDAK memindahkan SL ke breakeven dan
-    # TIDAK melakukan partial close, outcome "SL setelah TP" tetap dihitung
-    # KALAH (rugi penuh di SL), bukan menang. Ini metrik paling jujur untuk
-    # menilai performa nyata, terpisah dari sekadar "sempat menyentuh TP1".
+    # SELL: close < entry). Trade yang ditutup impas di breakeven (outcome_price
+    # == entry) TIDAK dihitung menang maupun kalah -- lihat breakeven_after_tp.
+    # Outcome "SL setelah TP" (bila breakeven dimatikan) tetap dihitung KALAH.
     summary["win_rate_closed_pct"] = (
         round((completed_wins / completed) * 100, 1)
         if completed > 0
@@ -1033,6 +1092,9 @@ def get_performance_summary(days: int = 30) -> dict[str, Any]:
 
     summary["completed_tp1_or_better"] = completed_tp1_or_better
     summary["completed_wins"] = completed_wins
+    summary["breakeven_after_tp"] = int(
+        summary.get("breakeven_after_tp") or 0
+    )
     summary["confidence_buckets"] = [
         dict(bucket_row)
         for bucket_row in bucket_rows
