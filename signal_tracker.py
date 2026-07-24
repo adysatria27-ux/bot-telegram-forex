@@ -153,6 +153,26 @@ def _safe_float(value: Any) -> Optional[float]:
     return number
 
 
+def _confidence_bucket(confidence: Optional[float]) -> str:
+    """
+    Melabeli confidence ke bucket yang sama dengan get_performance_summary().
+
+    Dipertahankan konsisten dengan CASE di query bucket supaya diagnostik dan
+    /stats memakai batas yang identik.
+    """
+    if confidence is None:
+        return "?"
+    if confidence < 60:
+        return "<60"
+    if confidence < 70:
+        return "60-69"
+    if confidence < 80:
+        return "70-79"
+    if confidence < 90:
+        return "80-89"
+    return "90-100"
+
+
 def _resolve_database_path() -> Path:
     """Menentukan lokasi database dengan dukungan Railway Volume."""
     configured = os.getenv(DATABASE_ENV_NAME, "").strip()
@@ -441,6 +461,14 @@ def record_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
         "false_breakout_against_pct": analysis.get(
             "false_breakout_against_pct"
         ),
+        # Diagnostik P2 -- overextension/late-entry per trade. Sebelumnya
+        # nilai ini hanya muncul di log & pesan Telegram lalu hilang,
+        # sehingga korelasi overextension vs outcome (mis. SL langsung)
+        # tidak bisa dianalisis dari DB. Sekarang ikut disimpan supaya
+        # /diag dan kalibrasi bobot ke depan bisa memakainya. Trade lama
+        # (sebelum perubahan ini) tidak punya key ini -> diagnostik
+        # menampilkannya sebagai "-".
+        "overextension_ratio_pct": analysis.get("overextension_ratio_pct"),
         "cache_hit": analysis.get("cache_hit", False),
         "cache_age_seconds": analysis.get(
             "cache_age_seconds",
@@ -1101,3 +1129,142 @@ def get_performance_summary(days: int = 30) -> dict[str, Any]:
     ]
     summary["database_path"] = str(get_database_path())
     return summary
+
+
+def get_direct_sl_diagnostics(days: int = 30) -> dict[str, Any]:
+    """
+    Diagnostik read-only untuk trade yang kena SL LANGSUNG.
+
+    Fokus: trade BUY/SELL yang CLOSED dengan outcome='SL' -- yaitu kena SL
+    tanpa pernah menyentuh TP1. Tujuannya menguji hipotesis "entry telat /
+    lokasi entry buruk" tanpa mengubah logika trading apa pun.
+
+    Kenapa MFE jadi proxy:
+        overextension_ratio hanya mulai tersimpan untuk trade BARU (lihat
+        record_analysis). Untuk trade lama nilai itu tidak ada, jadi proxy
+        utamanya adalah MFE (Maximum Favorable Excursion) yang MEMANG sudah
+        tersimpan sejak awal:
+          - mfe_r  = MFE / risk (|entry - sl|). Mendekati 0 artinya harga
+                     nyaris tidak pernah bergerak ke arah kita sebelum kena
+                     SL -> ciri entry buruk/telat (mendukung hipotesis).
+          - mfe_tp1= MFE / jarak(entry->TP1). Mendekati 1 artinya nyaris
+                     menyentuh TP1 lalu berbalik -> soal volatilitas/target,
+                     bukan lokasi entry.
+
+    Return dict berisi ringkasan agregat + daftar per-trade (siap diformat
+    untuk Telegram di tes_bot._format_diag_stats).
+    """
+    initialize_database()
+
+    safe_days = max(1, min(int(days), 3650))
+    start_time = _to_iso(_utc_now() - timedelta(days=safe_days))
+
+    with _connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT created_at, symbol, signal, confidence, trend,
+                   market_structure, entry, sl, tp1, mfe, mae,
+                   metadata_json
+            FROM analyses
+            WHERE created_at >= ?
+              AND signal IN ('BUY', 'SELL')
+              AND status = 'CLOSED'
+              AND outcome = 'SL'
+            ORDER BY created_at ASC
+            """,
+            (start_time,),
+        ).fetchall()
+
+    trades: list[dict[str, Any]] = []
+    mfe_r_values: list[float] = []
+    mfe_tp1_values: list[float] = []
+    overext_values: list[float] = []
+    sideways_values: list[float] = []
+    fbo_values: list[float] = []
+    per_pair: dict[str, int] = {}
+    per_bucket: dict[str, int] = {}
+    never_moved = 0
+
+    for row in rows:
+        entry = _safe_float(row["entry"])
+        sl = _safe_float(row["sl"])
+        tp1 = _safe_float(row["tp1"])
+        mfe = _safe_float(row["mfe"])
+        confidence = _safe_float(row["confidence"])
+
+        risk = (
+            abs(entry - sl)
+            if entry is not None and sl is not None
+            else None
+        )
+        tp1_distance = (
+            abs(tp1 - entry)
+            if tp1 is not None and entry is not None
+            else None
+        )
+        mfe_r = (mfe / risk) if (mfe is not None and risk) else None
+        mfe_tp1 = (
+            (mfe / tp1_distance)
+            if (mfe is not None and tp1_distance)
+            else None
+        )
+
+        symbol = str(row["symbol"])
+        bucket = _confidence_bucket(confidence)
+        per_pair[symbol] = per_pair.get(symbol, 0) + 1
+        per_bucket[bucket] = per_bucket.get(bucket, 0) + 1
+
+        if mfe_r is not None:
+            mfe_r_values.append(mfe_r)
+            if mfe_r < 0.10:
+                never_moved += 1
+        if mfe_tp1 is not None:
+            mfe_tp1_values.append(mfe_tp1)
+
+        try:
+            meta = json.loads(row["metadata_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            meta = {}
+        overext = _safe_float(meta.get("overextension_ratio_pct"))
+        sideways = _safe_float(meta.get("sideways_ratio_pct"))
+        fbo = _safe_float(meta.get("false_breakout_against_pct"))
+        if overext is not None:
+            overext_values.append(overext)
+        if sideways is not None:
+            sideways_values.append(sideways)
+        if fbo is not None:
+            fbo_values.append(fbo)
+
+        trades.append(
+            {
+                "created_at": row["created_at"],
+                "symbol": symbol,
+                "signal": str(row["signal"]),
+                "confidence": confidence,
+                "trend": row["trend"],
+                "mfe_r": mfe_r,
+                "mfe_tp1": mfe_tp1,
+                "overextension_ratio_pct": overext,
+            }
+        )
+
+    def _avg(values: list[float]) -> Optional[float]:
+        return (sum(values) / len(values)) if values else None
+
+    total = len(trades)
+    return {
+        "days": safe_days,
+        "count": total,
+        "trades": trades,
+        "per_pair": per_pair,
+        "per_bucket": per_bucket,
+        "avg_mfe_r": _avg(mfe_r_values),
+        "avg_mfe_tp1": _avg(mfe_tp1_values),
+        "never_moved": never_moved,
+        "never_moved_pct": (never_moved / total * 100) if total else 0.0,
+        "avg_overextension_pct": _avg(overext_values),
+        "overextension_sample": len(overext_values),
+        "avg_sideways_ratio_pct": _avg(sideways_values),
+        "avg_false_breakout_against_pct": _avg(fbo_values),
+        "database_path": str(get_database_path()),
+    }
