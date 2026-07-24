@@ -36,6 +36,7 @@ from signal_tracker import (
     get_open_symbols,
     get_recent_signals,
     get_performance_summary,
+    get_direct_sl_diagnostics,
 )
 
 
@@ -314,6 +315,118 @@ def _format_tracker_stats(
     return "\n".join(lines)
 
 
+def _format_diag_stats(diag: dict) -> str:
+    """
+    Membuat laporan diagnostik SL-langsung untuk Telegram.
+
+    Membedah trade yang kena SL LANGSUNG (belum pernah sentuh TP1) untuk
+    menguji hipotesis "entry telat / lokasi entry buruk" -- lihat
+    get_direct_sl_diagnostics() untuk penjelasan proxy MFE.
+    """
+    count = int(diag.get("count") or 0)
+
+    lines = [
+        f"🔍 Diagnostik SL-Langsung — {diag.get('days', 30)} Hari",
+        "",
+        f"Jumlah SL-langsung (belum pernah TP1): {count}",
+    ]
+
+    if count == 0:
+        lines.extend(["", "Tidak ada SL-langsung untuk dianalisis. 👍"])
+        return "\n".join(lines)
+
+    def _fmt2(value) -> str:
+        return f"{value:.2f}" if isinstance(value, (int, float)) else "-"
+
+    def _fmt1(value) -> str:
+        return f"{value:.1f}" if isinstance(value, (int, float)) else "-"
+
+    never_moved = int(diag.get("never_moved") or 0)
+    overext_sample = int(diag.get("overextension_sample") or 0)
+
+    lines.extend(
+        [
+            "",
+            "Proxy late-entry (kunci hipotesis):",
+            f"• Rata-rata MFE/R (arah kita): {_fmt2(diag.get('avg_mfe_r'))}",
+            f"• Rata-rata MFE/TP1: {_fmt2(diag.get('avg_mfe_tp1'))}",
+            f"• 'Langsung lawan' (MFE/R<0.10): {never_moved}/{count} "
+            f"({float(diag.get('never_moved_pct') or 0.0):.0f}%)",
+            f"• Rata-rata sideways_ratio: "
+            f"{_fmt1(diag.get('avg_sideways_ratio_pct'))}",
+            f"• Rata-rata false_bo_against: "
+            f"{_fmt1(diag.get('avg_false_breakout_against_pct'))}",
+        ]
+    )
+
+    # Overextension hanya tersedia untuk trade BARU (setelah persistensi
+    # ditambahkan). Tampilkan jumlah sampel supaya tidak menyesatkan.
+    if overext_sample > 0:
+        lines.append(
+            f"• Rata-rata overextension: "
+            f"{_fmt1(diag.get('avg_overextension_pct'))} "
+            f"(dari {overext_sample} trade dgn data)"
+        )
+    else:
+        lines.append(
+            "• Overextension: belum ada data (trade lama tidak menyimpannya; "
+            "trade baru akan mulai terisi)"
+        )
+
+    lines.extend(
+        [
+            "",
+            f"Per pair: {diag.get('per_pair')}",
+            f"Per confidence: {diag.get('per_bucket')}",
+            "",
+            "Rincian per trade (tgl | pair | dir | conf | MFE/R | MFE/TP1):",
+        ]
+    )
+
+    for trade in diag.get("trades", []):
+        confidence = trade.get("confidence")
+        conf_text = (
+            f"{confidence:.0f}%"
+            if isinstance(confidence, (int, float))
+            else "-"
+        )
+        lines.append(
+            f"• {str(trade.get('created_at'))[:10]} | "
+            f"{trade.get('symbol')} | {trade.get('signal')} | "
+            f"{conf_text} | {_fmt2(trade.get('mfe_r'))} | "
+            f"{_fmt2(trade.get('mfe_tp1'))}"
+        )
+
+    lines.extend(
+        [
+            "",
+            "Bacaan: 'Langsung lawan' tinggi + MFE/R rendah = entry di lokasi "
+            "buruk/telat (harga tak pernah gerak ke arah kita). MFE/TP1 tinggi "
+            "= nyaris TP1 lalu berbalik (soal volatilitas/target, bukan lokasi "
+            "entry).",
+        ]
+    )
+
+    text = "\n".join(lines)
+    if len(text) <= 4096:
+        return text
+
+    # Padatkan: buang rincian per-trade kalau kepanjangan, sisakan agregat.
+    safe_lines: list[str] = []
+    total = 0
+    for line in lines:
+        if line.startswith("• ") and "|" in line and "MFE" not in line:
+            # baris rincian per-trade -- boleh dipotong duluan
+            continue
+        addition = len(line) + 1
+        if total + addition > 4050:
+            break
+        safe_lines.append(line)
+        total += addition
+    safe_lines.append("_Rincian per-trade dipadatkan karena batas Telegram._")
+    return "\n".join(safe_lines)
+
+
 async def signals_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -362,6 +475,40 @@ async def stats_command(
         logger.exception("Gagal membuat statistik signal.")
         await update.message.reply_text(
             "❌ Gagal membuat statistik signal."
+        )
+
+
+async def diag_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Perintah /diag: diagnostik read-only trade SL-langsung.
+
+    Memperbarui dulu outcome yang masih aktif (sama seperti /stats) supaya
+    data konsisten, lalu menampilkan pembedahan SL-langsung. Tidak mengubah
+    logika trading apa pun.
+    """
+    if update.message is None:
+        return
+
+    try:
+        await update.message.reply_text(
+            "⏳ Memperbarui outcome lalu menyusun diagnostik SL-langsung..."
+        )
+        await _refresh_all_open_signals()
+
+        diag = await asyncio.to_thread(
+            get_direct_sl_diagnostics,
+            TRACKER_STATS_DAYS,
+        )
+        await update.message.reply_text(
+            _format_diag_stats(diag)
+        )
+    except Exception:
+        logger.exception("Gagal membuat diagnostik SL-langsung.")
+        await update.message.reply_text(
+            "❌ Gagal membuat diagnostik SL-langsung."
         )
 
 # =============================================================================
@@ -542,6 +689,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signals", signals_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("diag", diag_command))
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
