@@ -38,6 +38,9 @@ from signal_tracker import (
     get_performance_summary,
     get_direct_sl_diagnostics,
     get_direction_census,
+    add_alert_subscriber,
+    remove_alert_subscriber,
+    get_alert_subscribers,
 )
 
 
@@ -60,6 +63,65 @@ TRACKER_INTERVAL = "5min"
 TRACKER_STATS_DAYS = 30
 TRACKER_RECENT_LIMIT = 10
 MAX_TRACKER_REFRESH_SYMBOLS = 8
+
+
+# =============================================================================
+# LIVE SCANNER -- konfigurasi (semua lewat env, reversibel)
+# =============================================================================
+def _env_list(name: str, default: list[str]) -> list[str]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Env %s bukan integer valid: %s", name, raw)
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Env %s bukan angka valid: %s", name, raw)
+        return default
+
+
+# Pair yang dipindai otomatis. Default = pilihan Bapak (XAU, BTC, EUR, GBP).
+# Bisa diubah tanpa sentuh kode lewat env ALERT_SCAN_SYMBOLS (pisah koma).
+ALERT_SCAN_SYMBOLS = _env_list(
+    "ALERT_SCAN_SYMBOLS",
+    ["XAU/USD", "BTC/USD", "EUR/USD", "GBP/USD"],
+)
+# Selang pemindaian (menit).
+ALERT_SCAN_INTERVAL_MINUTES = _env_int("ALERT_SCAN_INTERVAL_MINUTES", 15)
+# Confidence minimum agar sebuah sinyal dialert. 0 = semua yang lolos gate bot.
+ALERT_MIN_CONFIDENCE = _env_float("ALERT_MIN_CONFIDENCE", 0.0)
+# Jeda anti-spam per pair (menit): sinyal arah sama tidak dialert ulang
+# selama jendela ini. Flip arah (BUY<->SELL) tetap dialert langsung.
+ALERT_COOLDOWN_MINUTES = _env_int("ALERT_COOLDOWN_MINUTES", 60)
+# Jeda antar pair saat memindai (detik) supaya beban API Twelve Data halus
+# dan tidak menabrak limit per-menit.
+ALERT_PAIR_DELAY_SECONDS = _env_float("ALERT_PAIR_DELAY_SECONDS", 2.0)
+# Saklar utama live scanner.
+ALERT_SCAN_ENABLED = os.getenv(
+    "ALERT_SCAN_ENABLED", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+
+# State anti-spam in-memory: symbol -> {"signal": str, "time": monotonic}.
+# Sengaja in-memory: kalau bot restart, paling banter satu sinyal aktif
+# dialert ulang sekali -- dapat diterima, dan menghindari kompleksitas DB.
+_alert_last: dict[str, dict] = {}
 
 
 # =============================================================================
@@ -565,6 +627,238 @@ async def diag_command(
             "❌ Gagal membuat diagnostik."
         )
 
+
+# =============================================================================
+# 5b. LIVE SCANNER -- kirim sinyal otomatis saat ada peluang BUY/SELL
+# =============================================================================
+def _should_alert(
+    signal: str,
+    confidence: float,
+    symbol: str,
+    now: float,
+    last_alert: dict[str, dict],
+    min_confidence: float,
+    cooldown_seconds: float,
+) -> bool:
+    """
+    Menentukan apakah sebuah sinyal layak dikirim sebagai alert (pure, mudah
+    dites). HOLD tidak pernah dialert. Sinyal arah sama tidak dialert ulang
+    selama cooldown; perubahan arah (BUY<->SELL) selalu dialert.
+    """
+    if signal not in {"BUY", "SELL"}:
+        return False
+    if confidence < min_confidence:
+        return False
+
+    previous = last_alert.get(symbol)
+    if previous is None:
+        return True
+    if previous.get("signal") != signal:
+        return True
+    return (now - float(previous.get("time", 0.0))) >= cooldown_seconds
+
+
+def _format_alert(analysis: dict) -> str:
+    """Pesan alert ringkas & actionable untuk eksekusi cepat."""
+    symbol = analysis.get("symbol", "-")
+    signal = analysis.get("signal", "HOLD")
+    confidence = float(analysis.get("confidence_pct") or 0.0)
+    trend = analysis.get("trend", "-")
+    risk = analysis.get("risk", "-")
+    decimals = int(analysis.get("decimal_places") or 2)
+
+    entry = analysis.get("entry") or analysis.get("entry_price")
+    stop_loss = analysis.get("sl")
+    tp1 = analysis.get("tp1")
+    tp2 = analysis.get("tp2")
+    tp3 = analysis.get("tp3")
+    rr1 = analysis.get("risk_reward_tp1")
+
+    emoji = "🟢" if signal == "BUY" else "🔴"
+    head_rr = f" | RR TP1 1:{rr1:.2f}" if isinstance(rr1, (int, float)) else ""
+
+    lines = [
+        f"🔔 *SINYAL LIVE — {symbol}*",
+        f"{emoji} *{signal}* | Conf {confidence:.1f}%{head_rr}",
+        "",
+    ]
+
+    def _p(value) -> str:
+        return f"{value:.{decimals}f}" if isinstance(value, (int, float)) else "-"
+
+    lines.extend(
+        [
+            f"*Entry:* {_p(entry)}",
+            f"*SL:* {_p(stop_loss)}",
+            f"*TP1:* {_p(tp1)}  *TP2:* {_p(tp2)}  *TP3:* {_p(tp3)}",
+            f"*Trend:* {trend} | *Risk:* {risk}",
+        ]
+    )
+
+    reasons = analysis.get("reasons") or []
+    if reasons:
+        lines.append("")
+        lines.append("*Alasan:*")
+        for reason in reasons[:4]:
+            lines.append(f"• {reason}")
+
+    lines.extend(
+        [
+            "",
+            "⚠️ _Bukan saran finansial. Kelola risiko sendiri._",
+        ]
+    )
+    return "\n".join(lines)
+
+
+async def alerts_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Perintah /alerts on|off|status untuk berlangganan sinyal live.
+
+    /alerts on     -> chat ini mulai menerima alert otomatis.
+    /alerts off    -> berhenti.
+    /alerts        -> tampilkan status + konfigurasi scanner.
+    """
+    if update.message is None or update.effective_chat is None:
+        return
+
+    chat_id = update.effective_chat.id
+    argument = (
+        context.args[0].strip().lower()
+        if getattr(context, "args", None)
+        else "status"
+    )
+
+    try:
+        if argument == "on":
+            await asyncio.to_thread(add_alert_subscriber, chat_id)
+            await update.message.reply_text(
+                "🔔 Alert live *AKTIF* untuk chat ini.\n"
+                f"Pair dipindai: {', '.join(ALERT_SCAN_SYMBOLS)}\n"
+                f"Tiap {ALERT_SCAN_INTERVAL_MINUTES} menit. Bot akan mengirim "
+                "sinyal begitu ada peluang BUY/SELL yang lolos.\n"
+                "_Catatan: HOLD tetap sering muncul saat market belum layak — "
+                "itu normal, alert hanya dikirim untuk sinyal berkualitas._",
+                parse_mode="Markdown",
+            )
+        elif argument == "off":
+            await asyncio.to_thread(remove_alert_subscriber, chat_id)
+            await update.message.reply_text(
+                "🔕 Alert live *DIMATIKAN* untuk chat ini.",
+                parse_mode="Markdown",
+            )
+        else:
+            subscribers = await asyncio.to_thread(get_alert_subscribers)
+            status = "AKTIF" if chat_id in subscribers else "nonaktif"
+            enabled = "ya" if ALERT_SCAN_ENABLED else "tidak (dimatikan env)"
+            await update.message.reply_text(
+                f"Status alert live chat ini: *{status}*\n"
+                f"Scanner global aktif: {enabled}\n"
+                f"Pair: {', '.join(ALERT_SCAN_SYMBOLS)}\n"
+                f"Interval: {ALERT_SCAN_INTERVAL_MINUTES} menit | "
+                f"Cooldown: {ALERT_COOLDOWN_MINUTES} menit\n"
+                "Gunakan /alerts on atau /alerts off.",
+                parse_mode="Markdown",
+            )
+    except Exception:
+        logger.exception("Gagal memproses /alerts | chat=%s", chat_id)
+        await update.message.reply_text("❌ Gagal memproses perintah /alerts.")
+
+
+async def _scan_once(application) -> None:
+    """
+    Satu siklus pemindaian: analisis tiap pair, kirim alert bila ada sinyal.
+
+    Hemat API: kalau tidak ada pelanggan, langsung berhenti tanpa memanggil
+    API sama sekali.
+    """
+    subscribers = await asyncio.to_thread(get_alert_subscribers)
+    if not subscribers:
+        return
+
+    now = time.monotonic()
+    cooldown_seconds = ALERT_COOLDOWN_MINUTES * 60
+
+    for symbol in ALERT_SCAN_SYMBOLS:
+        try:
+            analysis = await get_market_data(symbol)
+            await _track_analysis(symbol, analysis)
+        except Exception:
+            logger.exception("Scanner gagal menganalisis | symbol=%s", symbol)
+            await asyncio.sleep(ALERT_PAIR_DELAY_SECONDS)
+            continue
+
+        signal = str(analysis.get("signal") or "HOLD")
+        confidence = float(analysis.get("confidence_pct") or 0.0)
+
+        if _should_alert(
+            signal,
+            confidence,
+            symbol,
+            now,
+            _alert_last,
+            ALERT_MIN_CONFIDENCE,
+            cooldown_seconds,
+        ):
+            _alert_last[symbol] = {"signal": signal, "time": now}
+            message = _format_alert(analysis)
+            for chat_id in subscribers:
+                try:
+                    await application.bot.send_message(
+                        chat_id=chat_id,
+                        text=message,
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Gagal kirim alert | chat=%s | symbol=%s",
+                        chat_id,
+                        symbol,
+                    )
+            logger.info(
+                "Alert live terkirim | symbol=%s | signal=%s | conf=%.1f | "
+                "penerima=%s",
+                symbol,
+                signal,
+                confidence,
+                len(subscribers),
+            )
+
+        # Jeda antar pair supaya beban API halus (limit per-menit Twelve Data).
+        await asyncio.sleep(ALERT_PAIR_DELAY_SECONDS)
+
+
+async def _scanner_loop(application) -> None:
+    """Loop latar pemindai. Berjalan di worker yang sama, tanpa service baru."""
+    await asyncio.sleep(10)  # beri jeda agar startup selesai
+    interval_seconds = max(60, ALERT_SCAN_INTERVAL_MINUTES * 60)
+
+    while True:
+        try:
+            await _scan_once(application)
+        except Exception:
+            logger.exception("Siklus scanner gagal.")
+        await asyncio.sleep(interval_seconds)
+
+
+async def _on_startup(application) -> None:
+    """Menyalakan live scanner setelah aplikasi siap."""
+    if not ALERT_SCAN_ENABLED:
+        logger.info("Live scanner dimatikan lewat env ALERT_SCAN_ENABLED.")
+        return
+
+    logger.info(
+        "Live scanner aktif | pairs=%s | interval=%smnt | cooldown=%smnt",
+        ALERT_SCAN_SYMBOLS,
+        ALERT_SCAN_INTERVAL_MINUTES,
+        ALERT_COOLDOWN_MINUTES,
+    )
+    asyncio.create_task(_scanner_loop(application))
+
+
 # =============================================================================
 # 6. HANDLER ANALISIS GENERIC
 # =============================================================================
@@ -738,12 +1032,18 @@ if __name__ == "__main__":
         database_path,
     )
 
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .post_init(_on_startup)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signals", signals_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("diag", diag_command))
+    app.add_handler(CommandHandler("alerts", alerts_command))
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
