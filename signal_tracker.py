@@ -304,6 +304,11 @@ def initialize_database() -> Path:
             CREATE INDEX IF NOT EXISTS idx_analyses_outcome
             ON analyses(outcome);
 
+            CREATE TABLE IF NOT EXISTS alert_subscribers (
+                chat_id INTEGER PRIMARY KEY,
+                created_at TEXT NOT NULL
+            );
+
             COMMIT;
             """
         )
@@ -1337,3 +1342,45 @@ def get_direction_census(days: int = 30) -> dict[str, Any]:
         census[key] = int(census[key] or 0)
     census["days"] = safe_days
     return census
+
+
+# =============================================================================
+# Pelanggan alert live (untuk live scanner di tes_bot.py)
+# =============================================================================
+def add_alert_subscriber(chat_id: int) -> bool:
+    """
+    Mendaftarkan sebuah chat untuk menerima alert sinyal live.
+
+    Return True jika baru ditambahkan, False jika sudah terdaftar.
+    """
+    initialize_database()
+    with _connect() as connection:
+        cursor = connection.execute(
+            """
+            INSERT OR IGNORE INTO alert_subscribers (chat_id, created_at)
+            VALUES (?, ?)
+            """,
+            (int(chat_id), _to_iso(_utc_now())),
+        )
+        return cursor.rowcount == 1
+
+
+def remove_alert_subscriber(chat_id: int) -> bool:
+    """Menghapus pendaftaran alert live. Return True jika ada yang dihapus."""
+    initialize_database()
+    with _connect() as connection:
+        cursor = connection.execute(
+            "DELETE FROM alert_subscribers WHERE chat_id = ?",
+            (int(chat_id),),
+        )
+        return cursor.rowcount > 0
+
+
+def get_alert_subscribers() -> list[int]:
+    """Mengembalikan seluruh chat_id yang berlangganan alert live."""
+    initialize_database()
+    with _connect() as connection:
+        rows = connection.execute(
+            "SELECT chat_id FROM alert_subscribers ORDER BY created_at ASC"
+        ).fetchall()
+    return [int(row["chat_id"]) for row in rows]
