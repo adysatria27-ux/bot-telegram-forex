@@ -1268,3 +1268,72 @@ def get_direct_sl_diagnostics(days: int = 30) -> dict[str, Any]:
         "avg_false_breakout_against_pct": _avg(fbo_values),
         "database_path": str(get_database_path()),
     }
+
+
+def get_direction_census(days: int = 30) -> dict[str, Any]:
+    """
+    Sensus arah BUY vs SELL (read-only) untuk cek bias arah bot.
+
+    Menjawab pertanyaan: apakah bot benar-benar pernah mengeluarkan SELL,
+    atau praktis long-only? Menghitung total sinyal per arah (semua status),
+    pecahan closed, menang realized per arah, dan SL-langsung per arah.
+    Tidak mengubah logika trading apa pun.
+
+    "Menang" konsisten dengan get_performance_summary: outcome_price di sisi
+    profit relatif entry (BUY: > entry, SELL: < entry). Breakeven (== entry)
+    tidak dihitung menang.
+    """
+    initialize_database()
+
+    safe_days = max(1, min(int(days), 3650))
+    start_time = _to_iso(_utc_now() - timedelta(days=safe_days))
+
+    with _connect() as connection:
+        row = connection.execute(
+            """
+            SELECT
+                SUM(CASE WHEN signal = 'BUY' THEN 1 ELSE 0 END)
+                    AS buy_total,
+                SUM(CASE WHEN signal = 'SELL' THEN 1 ELSE 0 END)
+                    AS sell_total,
+                SUM(CASE WHEN signal = 'HOLD' THEN 1 ELSE 0 END)
+                    AS holds,
+                SUM(CASE WHEN signal = 'BUY' AND status = 'OPEN'
+                        THEN 1 ELSE 0 END) AS buy_open,
+                SUM(CASE WHEN signal = 'SELL' AND status = 'OPEN'
+                        THEN 1 ELSE 0 END) AS sell_open,
+                SUM(CASE WHEN signal = 'BUY' AND status = 'CLOSED'
+                        THEN 1 ELSE 0 END) AS buy_closed,
+                SUM(CASE WHEN signal = 'SELL' AND status = 'CLOSED'
+                        THEN 1 ELSE 0 END) AS sell_closed,
+                SUM(
+                    CASE
+                        WHEN signal = 'BUY' AND status = 'CLOSED'
+                         AND entry IS NOT NULL AND outcome_price IS NOT NULL
+                         AND outcome_price > entry
+                        THEN 1 ELSE 0
+                    END
+                ) AS buy_wins,
+                SUM(
+                    CASE
+                        WHEN signal = 'SELL' AND status = 'CLOSED'
+                         AND entry IS NOT NULL AND outcome_price IS NOT NULL
+                         AND outcome_price < entry
+                        THEN 1 ELSE 0
+                    END
+                ) AS sell_wins,
+                SUM(CASE WHEN signal = 'BUY' AND outcome = 'SL'
+                        THEN 1 ELSE 0 END) AS buy_direct_sl,
+                SUM(CASE WHEN signal = 'SELL' AND outcome = 'SL'
+                        THEN 1 ELSE 0 END) AS sell_direct_sl
+            FROM analyses
+            WHERE created_at >= ?
+            """,
+            (start_time,),
+        ).fetchone()
+
+    census = dict(row) if row is not None else {}
+    for key in list(census.keys()):
+        census[key] = int(census[key] or 0)
+    census["days"] = safe_days
+    return census
