@@ -37,6 +37,7 @@ from signal_tracker import (
     get_recent_signals,
     get_performance_summary,
     get_direct_sl_diagnostics,
+    get_direction_census,
 )
 
 
@@ -478,25 +479,78 @@ async def stats_command(
         )
 
 
+def _format_direction_census(census: dict) -> str:
+    """
+    Membuat laporan sensus arah BUY vs SELL untuk cek bias arah bot.
+    """
+    buy_total = int(census.get("buy_total") or 0)
+    sell_total = int(census.get("sell_total") or 0)
+    buy_closed = int(census.get("buy_closed") or 0)
+    sell_closed = int(census.get("sell_closed") or 0)
+    buy_wins = int(census.get("buy_wins") or 0)
+    sell_wins = int(census.get("sell_wins") or 0)
+    buy_direct_sl = int(census.get("buy_direct_sl") or 0)
+    sell_direct_sl = int(census.get("sell_direct_sl") or 0)
+    trade_total = buy_total + sell_total
+
+    lines = [
+        f"🧭 Sensus Arah BUY vs SELL — {census.get('days', 30)} Hari",
+        "",
+        f"Total sinyal BUY/SELL: {trade_total}",
+        f"• BUY : {buy_total}  (closed {buy_closed}, menang {buy_wins}, "
+        f"SL-langsung {buy_direct_sl})",
+        f"• SELL: {sell_total}  (closed {sell_closed}, menang {sell_wins}, "
+        f"SL-langsung {sell_direct_sl})",
+    ]
+
+    if trade_total > 0:
+        buy_share = buy_total / trade_total * 100
+        lines.append(f"• Porsi BUY: {buy_share:.0f}% | SELL: {100 - buy_share:.0f}%")
+
+    lines.append("")
+    if sell_total == 0 and buy_total > 0:
+        lines.append(
+            "⚠️ Bot TIDAK PERNAH mengeluarkan SELL pada periode ini — "
+            "indikasi bias long. Perlu diselidiki (bukan sekadar tuning)."
+        )
+    elif trade_total > 0 and (buy_total / trade_total) >= 0.85:
+        lines.append(
+            "⚠️ Sinyal sangat berat ke BUY (≥85%). Kemungkinan bias long — "
+            "perlu diselidiki."
+        )
+    else:
+        lines.append("Distribusi arah relatif seimbang.")
+
+    return "\n".join(lines)
+
+
 async def diag_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """
-    Perintah /diag: diagnostik read-only trade SL-langsung.
+    Perintah /diag: diagnostik read-only.
 
     Memperbarui dulu outcome yang masih aktif (sama seperti /stats) supaya
-    data konsisten, lalu menampilkan pembedahan SL-langsung. Tidak mengubah
-    logika trading apa pun.
+    data konsisten, lalu mengirim dua bagian: (1) sensus arah BUY/SELL untuk
+    cek bias, (2) pembedahan SL-langsung. Tidak mengubah logika trading.
     """
     if update.message is None:
         return
 
     try:
         await update.message.reply_text(
-            "⏳ Memperbarui outcome lalu menyusun diagnostik SL-langsung..."
+            "⏳ Memperbarui outcome lalu menyusun diagnostik..."
         )
         await _refresh_all_open_signals()
+
+        census = await asyncio.to_thread(
+            get_direction_census,
+            TRACKER_STATS_DAYS,
+        )
+        await update.message.reply_text(
+            _format_direction_census(census)
+        )
 
         diag = await asyncio.to_thread(
             get_direct_sl_diagnostics,
@@ -506,9 +560,9 @@ async def diag_command(
             _format_diag_stats(diag)
         )
     except Exception:
-        logger.exception("Gagal membuat diagnostik SL-langsung.")
+        logger.exception("Gagal membuat diagnostik.")
         await update.message.reply_text(
-            "❌ Gagal membuat diagnostik SL-langsung."
+            "❌ Gagal membuat diagnostik."
         )
 
 # =============================================================================
