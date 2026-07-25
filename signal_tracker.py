@@ -1036,6 +1036,66 @@ def get_recent_signals(limit: int = 10) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def get_signals_for_website(limit: int = 20) -> list[dict[str, Any]]:
+    """
+    Mengambil sinyal BUY/SELL terbaru dengan detail lengkap untuk Web API.
+
+    Berbeda dari get_recent_signals() (dipakai /signals di Telegram, kolom
+    terbatas): fungsi ini menyertakan rr1/rr2/rr3 dan reasons_json yang
+    di-parse, supaya dashboard website bisa menampilkan RR dan alasan sinyal
+    persis seperti pesan Telegram -- tanpa duplikasi logika penghitungan.
+
+    Read-only, tidak menyentuh logika trading/scoring. Urutan: OPEN dulu
+    (masih relevan untuk dipantau), baru CLOSED terbaru.
+    """
+    initialize_database()
+
+    safe_limit = max(1, min(int(limit), MAX_RECENT_SIGNAL_LIMIT))
+
+    with _connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT id,
+                   created_at,
+                   symbol,
+                   signal,
+                   confidence,
+                   trend,
+                   status,
+                   outcome,
+                   max_tp_hit,
+                   entry,
+                   sl,
+                   tp1,
+                   tp2,
+                   tp3,
+                   rr1,
+                   rr2,
+                   rr3,
+                   reasons_json
+            FROM analyses
+            WHERE signal IN ('BUY', 'SELL')
+            ORDER BY
+                CASE WHEN status = 'OPEN' THEN 0 ELSE 1 END,
+                id DESC
+            LIMIT ?
+            """,
+            (safe_limit,),
+        ).fetchall()
+
+    signals: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        try:
+            reasons = json.loads(item.pop("reasons_json") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            reasons = []
+        item["reasons"] = reasons if isinstance(reasons, list) else []
+        signals.append(item)
+
+    return signals
+
+
 def get_performance_summary(days: int = 30) -> dict[str, Any]:
     """Menghasilkan statistik ringkas untuk kalibrasi awal."""
     initialize_database()
