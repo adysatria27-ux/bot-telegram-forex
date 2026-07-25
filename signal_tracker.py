@@ -61,6 +61,23 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _env_float(name: str, default: float) -> float:
+    """Membaca environment variable float secara toleran."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(
+            "Nilai environment variable %s='%s' tidak valid, pakai default %s.",
+            name,
+            raw,
+            default,
+        )
+        return default
+
+
 # Manajemen trade -- Breakeven setelah TP1.
 # Setelah TP1 tersentuh, SL efektif dipindah ke harga entry sehingga trade
 # yang sudah bergerak ke arah kita tidak lagi bisa berbalik menjadi kerugian
@@ -68,6 +85,24 @@ def _env_flag(name: str, default: bool) -> bool:
 # dimatikan lewat environment variable BREAKEVEN_AFTER_TP1=0 bila ingin
 # kembali ke perilaku lama (SL awal tetap sampai trade selesai).
 BREAKEVEN_AFTER_TP1 = _env_flag("BREAKEVEN_AFTER_TP1", True)
+
+# Lever B (rancangan geometri SL/TP) -- Breakeven SEBELUM TP1, begitu profit
+# mengambang (MFE) mencapai kelipatan risk ini. Target utamanya kasus XAU
+# "nyaris menang lalu dikembalikan penuh" (/diag 2026-07-24: beberapa XAU
+# yang kena SL langsung sempat MFE/R >1.0, satu bahkan 0.93 ke TP1, sebelum
+# berbalik penuh -- breakeven-setelah-TP1 tidak menolong karena TP1 di 2R
+# belum sempat tersentuh). Default 1.0R dipilih dari simulasi memakai 12
+# SL-langsung historis (Bapak): ambang 1.0R menyelamatkan 3 trade (+3R),
+# ambang lebih rendah (0.5R) menyelamatkan lebih banyak (+6R) tapi lebih
+# berisiko memotong calon pemenang yang masih dalam pullback wajar.
+# TRADE-OFF YANG HARUS DIPANTAU: mekanisme ini bisa menutup SEBAGIAN
+# pemenang di breakeven (0R) padahal kalau dibiarkan bisa lanjut ke TP --
+# biaya di sisi pemenang belum terukur presisi (lihat rancangan geometri
+# SL/TP). Pantau /stats: kalau TP2/TP3 hit-rate terlihat turun drastis
+# dibanding sebelum ini aktif, naikkan ambang (mis. 1.5) atau matikan
+# (set ke 0) lewat environment variable BREAKEVEN_AT_MFE_R -- tanpa perlu
+# ubah kode/redeploy.
+BREAKEVEN_AT_MFE_R = _env_float("BREAKEVEN_AT_MFE_R", 1.0)
 
 
 def _utc_now() -> datetime:
@@ -710,15 +745,21 @@ def _closed_outcome_after_sl(max_tp_hit: int) -> str:
 
 
 def _breakeven_outcome(max_tp_hit: int) -> str:
-    """Nama outcome saat SL breakeven (di entry) tersentuh setelah TP.
+    """Nama outcome saat SL breakeven (di entry) tersentuh.
 
     Berbeda dari SL_AFTER_TP: ini BUKAN kerugian penuh, melainkan trade yang
-    ditutup impas (0R) karena SL sudah dipindah ke entry setelah TP1. Dengan
-    max_tp_hit selalu >= 1 saat breakeven aktif, nama outcome selalu
-    BREAKEVEN_AFTER_TPn (fallback "SL" hanya jaga-jaga jika dipanggil salah).
+    ditutup impas (0R) karena SL sudah dipindah ke entry. Dua rute breakeven
+    mungkin aktif:
+      - Setelah TP1 (max_tp_hit >= 1): breakeven lama (P1) -> outcome
+        BREAKEVEN_AFTER_TPn.
+      - SEBELUM TP1 (max_tp_hit == 0), lewat Lever B (BREAKEVEN_AT_MFE_R):
+        profit mengambang sudah cukup jauh tapi TP1 belum tersentuh ->
+        outcome BREAKEVEN_PRE_TP1. Ini SENGAJA dibedakan dari
+        BREAKEVEN_AFTER_TP0 supaya /stats bisa memisahkan dua rezim risiko
+        yang berbeda (setelah bank profit 2R vs baru 1R).
     """
     if max_tp_hit <= 0:
-        return "SL"
+        return "BREAKEVEN_PRE_TP1"
 
     return f"BREAKEVEN_AFTER_TP{max_tp_hit}"
 
@@ -801,6 +842,7 @@ def update_open_signals(
             max_tp_hit = int(row["max_tp_hit"] or 0)
             mfe = float(row["mfe"] or 0.0)
             mae = float(row["mae"] or 0.0)
+            risk = abs(entry - sl)
             status = "OPEN"
             outcome = str(row["outcome"] or "PENDING")
             outcome_at = row["outcome_at"]
@@ -814,6 +856,12 @@ def update_open_signals(
                     float(candle["high"]),
                     float(candle["low"]),
                 )
+                # Breakeven-dini (Lever B) dicek pakai MFE SEBELUM candle
+                # ini diproses -- konsisten dengan cara max_tp_hit dicek
+                # untuk breakeven-setelah-TP1 (hindari asumsi urutan
+                # intrabar: kita tidak tahu apakah high atau low duluan
+                # dalam satu candle).
+                mfe_before_candle = mfe
                 mfe = max(mfe, favorable)
                 mae = max(mae, adverse)
                 latest_checked = _to_iso(candle["datetime"])
@@ -825,9 +873,19 @@ def update_open_signals(
                 # max_tp_hit di titik ini masih nilai dari candle sebelumnya
                 # (0), sehingga SL awal tetap dipakai untuk candle itu --
                 # konservatif dan menghindari asumsi urutan intrabar.
-                breakeven_active = (
+                breakeven_from_tp1 = (
                     BREAKEVEN_AFTER_TP1 and max_tp_hit >= 1
                 )
+                # Lever B: breakeven begitu MFE (sebelum candle ini) sudah
+                # mencapai BREAKEVEN_AT_MFE_R x risk, walau TP1 (2R) belum
+                # kena. BREAKEVEN_AT_MFE_R<=0 mematikan lever ini sepenuhnya
+                # (perilaku identik dengan sebelum Lever B ada).
+                breakeven_from_mfe = (
+                    BREAKEVEN_AT_MFE_R > 0
+                    and risk > 0
+                    and mfe_before_candle >= (BREAKEVEN_AT_MFE_R * risk)
+                )
+                breakeven_active = breakeven_from_tp1 or breakeven_from_mfe
                 effective_sl = entry if breakeven_active else sl
 
                 # Konservatif: SL diperiksa sebelum TP di candle yang sama.
@@ -1022,6 +1080,13 @@ def get_performance_summary(days: int = 30) -> dict[str, Any]:
                         ELSE 0
                     END
                 ) AS breakeven_after_tp,
+                SUM(
+                    CASE
+                        WHEN outcome = 'BREAKEVEN_PRE_TP1'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS breakeven_pre_tp1,
                 SUM(CASE WHEN outcome LIKE '%EXPIRED%' THEN 1 ELSE 0 END)
                     AS expired,
                 SUM(
@@ -1127,6 +1192,9 @@ def get_performance_summary(days: int = 30) -> dict[str, Any]:
     summary["completed_wins"] = completed_wins
     summary["breakeven_after_tp"] = int(
         summary.get("breakeven_after_tp") or 0
+    )
+    summary["breakeven_pre_tp1"] = int(
+        summary.get("breakeven_pre_tp1") or 0
     )
     summary["confidence_buckets"] = [
         dict(bucket_row)
