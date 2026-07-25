@@ -415,6 +415,9 @@ def _format_diag_stats(diag: dict) -> str:
             f"• Rata-rata MFE/TP1: {_fmt2(diag.get('avg_mfe_tp1'))}",
             f"• 'Langsung lawan' (MFE/R<0.10): {never_moved}/{count} "
             f"({float(diag.get('never_moved_pct') or 0.0):.0f}%)",
+            f"• Rata-rata MAE/R (seberapa jauh lewat SL): "
+            f"{_fmt2(diag.get('avg_mae_r'))} "
+            f"(terburuk {_fmt2(diag.get('max_mae_r'))})",
             f"• Rata-rata sideways_ratio: "
             f"{_fmt1(diag.get('avg_sideways_ratio_pct'))}",
             f"• Rata-rata false_bo_against: "
@@ -442,7 +445,8 @@ def _format_diag_stats(diag: dict) -> str:
             f"Per pair: {diag.get('per_pair')}",
             f"Per confidence: {diag.get('per_bucket')}",
             "",
-            "Rincian per trade (tgl | pair | dir | conf | MFE/R | MFE/TP1):",
+            "Rincian per trade (tgl | pair | dir | conf | MFE/R | MFE/TP1 | "
+            "MAE/R):",
         ]
     )
 
@@ -457,7 +461,7 @@ def _format_diag_stats(diag: dict) -> str:
             f"• {str(trade.get('created_at'))[:10]} | "
             f"{trade.get('symbol')} | {trade.get('signal')} | "
             f"{conf_text} | {_fmt2(trade.get('mfe_r'))} | "
-            f"{_fmt2(trade.get('mfe_tp1'))}"
+            f"{_fmt2(trade.get('mfe_tp1'))} | {_fmt2(trade.get('mae_r'))}"
         )
 
     lines.extend(
@@ -466,7 +470,11 @@ def _format_diag_stats(diag: dict) -> str:
             "Bacaan: 'Langsung lawan' tinggi + MFE/R rendah = entry di lokasi "
             "buruk/telat (harga tak pernah gerak ke arah kita). MFE/TP1 tinggi "
             "= nyaris TP1 lalu berbalik (soal volatilitas/target, bukan lokasi "
-            "entry).",
+            "entry). MAE/R punya batas bawah ~1.0 (SL memang tersentuh) -- "
+            "MAE/R mendekati 1.0-1.2 = SL sedikit lebih lebar mungkin bisa "
+            "menahan (relevan utk kalibrasi SL crypto); MAE/R jauh di atas "
+            "1.5 = harga memang terus melawan, pelebaran SL kemungkinan "
+            "tidak menolong.",
         ]
     )
 
