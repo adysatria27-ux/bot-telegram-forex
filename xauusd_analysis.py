@@ -150,6 +150,16 @@ class AssetConfig:
     # ~1.10 dan indeks yang harganya ~4000 sama-sama satu digit di depan
     # tapi granularitas pip/poin-nya jauh berbeda.
     psychological_increment: float = 0.0
+    # Geometri SL/TP per-instrumen (rancangan geometri SL/TP, belum
+    # dideploy sebelumnya). None berarti "pakai default global" (perilaku
+    # SAMA seperti sebelum field ini ada) -- lihat _resolve_risk_geometry().
+    # Dasar bukti: /diag membedah 12 SL-langsung dan menemukan XAU vs BTC
+    # gagal karena alasan BERLAWANAN (lihat catatan di BTC/ETH di bawah),
+    # jadi satu multiplier global tidak cocok untuk keduanya.
+    atr_sl_multiplier: Optional[float] = None
+    rr_tp1: Optional[float] = None
+    rr_tp2: Optional[float] = None
+    rr_tp3: Optional[float] = None
 
 
 SUPPORTED_ASSETS: tuple[AssetConfig, ...] = (
@@ -255,6 +265,12 @@ SUPPORTED_ASSETS: tuple[AssetConfig, ...] = (
         menu_label="BTC/USD",
         analysis_cache_ttl_seconds=20,
         aliases=("BTCUSD", "BITCOIN"),
+        # SL 1.5x ATR (default global) terbukti terlalu ketat untuk noise
+        # BTC -- /diag 2026-07-24: 3/4 BTC yang kena SL langsung punya
+        # MFE/R <=0.11 (ke-wick keluar, nyaris tak sempat bergerak ke arah
+        # kita). Dilebarkan ke 2.2x ATR. TP1/2/3 tetap RR 2/3/4 (TP ikut
+        # menyesuaikan otomatis dari risk_distance, RR tidak berkurang).
+        atr_sl_multiplier=2.2,
     ),
     AssetConfig(
         symbol="ETH/USD",
@@ -266,6 +282,10 @@ SUPPORTED_ASSETS: tuple[AssetConfig, ...] = (
         menu_label="ETH/USD",
         analysis_cache_ttl_seconds=20,
         aliases=("ETHUSD", "ETHEREUM"),
+        # Disamakan dengan BTC (sama-sama crypto, noise serupa) walau belum
+        # ada sampel /diag khusus ETH -- pantau /diag terpisah per pair
+        # setelah live untuk konfirmasi/koreksi.
+        atr_sl_multiplier=2.2,
     ),
     AssetConfig(
         symbol="NAS100",
@@ -359,6 +379,40 @@ RR_TARGET_TP3 = 4.0
 # Ditegakkan juga sebagai hard-gate di _build_market_analysis, bukan cuma
 # konsekuensi tidak langsung dari multiplier di atas.
 MIN_RISK_REWARD_RATIO = 2.0
+
+
+def _resolve_risk_geometry(
+    asset: "AssetConfig",
+) -> tuple[float, float, float, float]:
+    """
+    Resolusi geometri SL/TP efektif untuk satu aset.
+
+    Field AssetConfig (atr_sl_multiplier/rr_tp1/2/3) bernilai None secara
+    default -> jatuh ke konstanta global di atas, artinya aset yang belum
+    diberi override berperilaku PERSIS seperti sebelum field ini ada.
+
+    Guard: rr_tp1 tidak pernah boleh di bawah MIN_RISK_REWARD_RATIO walau
+    override aset salah diisi -- aturan RR minimum 1:2 (item 8 instruksi)
+    tidak boleh bocor lewat konfigurasi per-aset.
+    """
+    atr_sl_multiplier = (
+        asset.atr_sl_multiplier
+        if asset.atr_sl_multiplier is not None
+        else ATR_SL_MULTIPLIER
+    )
+    rr_tp1 = asset.rr_tp1 if asset.rr_tp1 is not None else RR_TARGET_TP1
+    rr_tp2 = asset.rr_tp2 if asset.rr_tp2 is not None else RR_TARGET_TP2
+    rr_tp3 = asset.rr_tp3 if asset.rr_tp3 is not None else RR_TARGET_TP3
+
+    if rr_tp1 < MIN_RISK_REWARD_RATIO:
+        rr_tp1 = MIN_RISK_REWARD_RATIO
+    if rr_tp2 < rr_tp1:
+        rr_tp2 = rr_tp1
+    if rr_tp3 < rr_tp2:
+        rr_tp3 = rr_tp2
+
+    return atr_sl_multiplier, rr_tp1, rr_tp2, rr_tp3
+
 
 # Sistem dibuat konservatif karena akurasi lebih penting daripada jumlah sinyal.
 SIGNAL_SCORE_THRESHOLD = 0.25
@@ -3027,8 +3081,22 @@ def _build_indicator_checklist(
 async def _build_market_analysis(
     symbol: str = DEFAULT_SYMBOL,
     psychological_increment: float = 0.0,
+    atr_sl_multiplier: float = ATR_SL_MULTIPLIER,
+    rr_tp1: float = RR_TARGET_TP1,
+    rr_tp2: float = RR_TARGET_TP2,
+    rr_tp3: float = RR_TARGET_TP3,
 ) -> dict:
     """Mengambil dan menganalisis market secara multi-timeframe."""
+    # Guard RR minimum -- lihat _resolve_risk_geometry(). Diulang di sini
+    # supaya _build_market_analysis tetap aman dipanggil langsung (mis. dari
+    # test) tanpa lewat get_market_data/_resolve_risk_geometry.
+    if rr_tp1 < MIN_RISK_REWARD_RATIO:
+        rr_tp1 = MIN_RISK_REWARD_RATIO
+    if rr_tp2 < rr_tp1:
+        rr_tp2 = rr_tp1
+    if rr_tp3 < rr_tp2:
+        rr_tp3 = rr_tp2
+
     if not TWELVE_DATA_API_KEY:
         raise RuntimeError(
             "TWELVE_DATA_API_KEY belum diatur pada environment variable."
@@ -3212,17 +3280,17 @@ async def _build_market_analysis(
     prospective_tp3: Optional[float] = None
 
     if candidate_signal == "BUY":
-        prospective_sl = entry_price - (ATR_SL_MULTIPLIER * atr_value)
+        prospective_sl = entry_price - (atr_sl_multiplier * atr_value)
         risk_distance = entry_price - prospective_sl
-        prospective_tp1 = entry_price + (risk_distance * RR_TARGET_TP1)
-        prospective_tp2 = entry_price + (risk_distance * RR_TARGET_TP2)
-        prospective_tp3 = entry_price + (risk_distance * RR_TARGET_TP3)
+        prospective_tp1 = entry_price + (risk_distance * rr_tp1)
+        prospective_tp2 = entry_price + (risk_distance * rr_tp2)
+        prospective_tp3 = entry_price + (risk_distance * rr_tp3)
     elif candidate_signal == "SELL":
-        prospective_sl = entry_price + (ATR_SL_MULTIPLIER * atr_value)
+        prospective_sl = entry_price + (atr_sl_multiplier * atr_value)
         risk_distance = prospective_sl - entry_price
-        prospective_tp1 = entry_price - (risk_distance * RR_TARGET_TP1)
-        prospective_tp2 = entry_price - (risk_distance * RR_TARGET_TP2)
-        prospective_tp3 = entry_price - (risk_distance * RR_TARGET_TP3)
+        prospective_tp1 = entry_price - (risk_distance * rr_tp1)
+        prospective_tp2 = entry_price - (risk_distance * rr_tp2)
+        prospective_tp3 = entry_price - (risk_distance * rr_tp3)
 
     risk_reward_tp1 = _calculate_risk_reward(
         entry_price if candidate_signal in {"BUY", "SELL"} else None,
@@ -3349,6 +3417,16 @@ async def _build_market_analysis(
         risk_reward_ok=enough_risk_reward,
     )
 
+    # Transparansi (item 12): kalau geometri SL/TP instrumen ini berbeda
+    # dari default global, jelaskan di alasan supaya tidak membingungkan
+    # saat dibandingkan dengan instrumen lain.
+    if signal in {"BUY", "SELL"} and atr_sl_multiplier != ATR_SL_MULTIPLIER:
+        reasons.append(
+            f"SL memakai {atr_sl_multiplier:.1f}x ATR (khusus instrumen "
+            f"ini, default global {ATR_SL_MULTIPLIER:.1f}x) -- disesuaikan "
+            "dari hasil diagnostik SL-langsung."
+        )
+
     logger.info(
         "Analisis selesai | symbol=%s | signal=%s | score=%.3f | "
         "confidence=%.1f | structure=%.2f | pattern=%.2f | "
@@ -3431,6 +3509,7 @@ async def _build_market_analysis(
         "trend_alignment_score": round(trend_alignment_score, 2),
         "counter_trend_penalty": round(counter_trend_penalty, 2),
         "min_risk_reward_ratio": MIN_RISK_REWARD_RATIO,
+        "atr_sl_multiplier_used": atr_sl_multiplier,
         "risk_reward_ok": enough_risk_reward,
         "near_psychological_level": near_psychological_level,
         "demand_zone": reference_result.demand_zone,
@@ -3551,9 +3630,16 @@ async def get_market_data(
             return cached_analysis
 
         provider_symbol = await _resolve_provider_symbol(asset)
+        atr_sl_multiplier, rr_tp1, rr_tp2, rr_tp3 = _resolve_risk_geometry(
+            asset
+        )
         analysis = await _build_market_analysis(
             provider_symbol,
             psychological_increment=asset.psychological_increment,
+            atr_sl_multiplier=atr_sl_multiplier,
+            rr_tp1=rr_tp1,
+            rr_tp2=rr_tp2,
+            rr_tp3=rr_tp3,
         )
 
         analysis["symbol"] = canonical_symbol
