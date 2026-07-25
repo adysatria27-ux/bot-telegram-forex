@@ -1156,6 +1156,19 @@ def get_direct_sl_diagnostics(days: int = 30) -> dict[str, Any]:
                      menyentuh TP1 lalu berbalik -> soal volatilitas/target,
                      bukan lokasi entry.
 
+    MAE (Maximum Adverse Excursion) untuk kalibrasi lebar SL:
+        mae_r = MAE / risk (|entry - sl|). Untuk trade yang closed via SL,
+        loop di update_open_signals() BERHENTI begitu SL kena (break), jadi
+        mae_r punya batas bawah ~1.0 (SL memang tersentuh) -- yang informatif
+        adalah SEBERAPA JAUH DI ATAS 1.0. mae_r ~1.0-1.1 artinya harga cuma
+        sedikit melewati SL saat ini -- indikasi SL sedikit lebih lebar bisa
+        menahan (relevan untuk noise crypto). mae_r jauh di atas 1.0 (mis.
+        >1.5) artinya harga memang terus bergerak melawan kita -- pelebaran
+        SL kemungkinan tidak akan menolong, itu memang pergerakan melawan.
+        CATATAN: ini bukan simulasi SL lebih lebar yang presisi (harga
+        setelah SL closed tidak lagi dilacak), tapi proxy murah yang cukup
+        untuk mengarahkan kalibrasi awal.
+
     Return dict berisi ringkasan agregat + daftar per-trade (siap diformat
     untuk Telegram di tes_bot._format_diag_stats).
     """
@@ -1183,6 +1196,7 @@ def get_direct_sl_diagnostics(days: int = 30) -> dict[str, Any]:
     trades: list[dict[str, Any]] = []
     mfe_r_values: list[float] = []
     mfe_tp1_values: list[float] = []
+    mae_r_values: list[float] = []
     overext_values: list[float] = []
     sideways_values: list[float] = []
     fbo_values: list[float] = []
@@ -1195,6 +1209,7 @@ def get_direct_sl_diagnostics(days: int = 30) -> dict[str, Any]:
         sl = _safe_float(row["sl"])
         tp1 = _safe_float(row["tp1"])
         mfe = _safe_float(row["mfe"])
+        mae = _safe_float(row["mae"])
         confidence = _safe_float(row["confidence"])
 
         risk = (
@@ -1213,6 +1228,7 @@ def get_direct_sl_diagnostics(days: int = 30) -> dict[str, Any]:
             if (mfe is not None and tp1_distance)
             else None
         )
+        mae_r = (mae / risk) if (mae is not None and risk) else None
 
         symbol = str(row["symbol"])
         bucket = _confidence_bucket(confidence)
@@ -1225,6 +1241,8 @@ def get_direct_sl_diagnostics(days: int = 30) -> dict[str, Any]:
                 never_moved += 1
         if mfe_tp1 is not None:
             mfe_tp1_values.append(mfe_tp1)
+        if mae_r is not None:
+            mae_r_values.append(mae_r)
 
         try:
             meta = json.loads(row["metadata_json"] or "{}")
@@ -1249,6 +1267,7 @@ def get_direct_sl_diagnostics(days: int = 30) -> dict[str, Any]:
                 "trend": row["trend"],
                 "mfe_r": mfe_r,
                 "mfe_tp1": mfe_tp1,
+                "mae_r": mae_r,
                 "overextension_ratio_pct": overext,
             }
         )
@@ -1265,6 +1284,8 @@ def get_direct_sl_diagnostics(days: int = 30) -> dict[str, Any]:
         "per_bucket": per_bucket,
         "avg_mfe_r": _avg(mfe_r_values),
         "avg_mfe_tp1": _avg(mfe_tp1_values),
+        "avg_mae_r": _avg(mae_r_values),
+        "max_mae_r": (max(mae_r_values) if mae_r_values else None),
         "never_moved": never_moved,
         "never_moved_pct": (never_moved / total * 100) if total else 0.0,
         "avg_overextension_pct": _avg(overext_values),
