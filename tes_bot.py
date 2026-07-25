@@ -322,6 +322,7 @@ def _format_tracker_stats(
     direct_sl = int(summary.get("direct_sl") or 0)
     sl_after_tp = int(summary.get("sl_after_tp") or 0)
     breakeven_after_tp = int(summary.get("breakeven_after_tp") or 0)
+    breakeven_pre_tp1 = int(summary.get("breakeven_pre_tp1") or 0)
     expired = int(summary.get("expired") or 0)
     win_rate_closed = float(summary.get("win_rate_closed_pct") or 0.0)
     tp1_hit_rate = float(summary.get("tp1_hit_rate_pct") or 0.0)
@@ -344,6 +345,7 @@ def _format_tracker_stats(
         f"SL langsung: {direct_sl}",
         f"SL setelah TP: {sl_after_tp}",
         f"Breakeven (setelah TP): {breakeven_after_tp}",
+        f"Breakeven (proteksi dini, sebelum TP1): {breakeven_pre_tp1}",
         f"Expired: {expired}",
         "",
         f"Win rate (selesai): {win_rate_closed:.1f}% ({completed} trade)",
@@ -370,9 +372,12 @@ def _format_tracker_stats(
             "Win rate & Sentuh TP1 hanya dari trade yang SUDAH SELESAI. "
             "Setelah TP1 tersentuh, SL dipindah ke entry (breakeven) — trade "
             "yang lalu berbalik ditutup impas 0R dan dicatat sebagai "
-            "Breakeven, bukan kalah. Win rate hanya menghitung trade yang "
-            "ditutup dalam profit (breakeven tidak dihitung menang maupun "
-            "kalah).",
+            "Breakeven, bukan kalah. SEKARANG breakeven juga bisa aktif "
+            "SEBELUM TP1 begitu profit mengambang cukup jauh (proteksi "
+            "dini) — dicatat terpisah sebagai 'Breakeven (proteksi dini)'. "
+            "Win rate hanya menghitung trade yang ditutup dalam profit "
+            "(breakeven, baik setelah maupun sebelum TP1, tidak dihitung "
+            "menang maupun kalah).",
         ]
     )
     return "\n".join(lines)
