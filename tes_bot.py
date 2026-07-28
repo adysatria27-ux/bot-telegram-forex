@@ -31,6 +31,7 @@ from xauusd_analysis import (
 
 from signal_tracker import (
     initialize_database,
+    archive_signals_before_epoch,
     record_analysis,
     update_open_signals,
     get_open_symbols,
@@ -353,6 +354,22 @@ def _format_tracker_stats(
     lines = [
         f"📈 Statistik Signal — {summary.get('days', 30)} Hari",
         "",
+    ]
+
+    # Kalau reset aktif, katakan terus terang. Tanpa baris ini angka yang
+    # tiba-tiba kecil akan terlihat seperti data hilang atau bot rusak.
+    stats_since = summary.get("stats_since")
+    if stats_since:
+        lines.extend(
+            [
+                f"🔄 Dihitung sejak reset: {str(stats_since)[:16]} UTC",
+                "Data sebelum titik ini masih tersimpan, hanya tidak "
+                "dihitung.",
+                "",
+            ]
+        )
+
+    lines.extend([
         f"Total analisis: {int(summary.get('total_analyses') or 0)}",
         f"HOLD: {holds}",
         f"BUY/SELL: {trade_signals}",
@@ -371,7 +388,7 @@ def _format_tracker_stats(
         f"Win rate (selesai): {win_rate_closed:.1f}% ({completed} trade)",
         f"Sentuh TP1 (selesai): {tp1_hit_rate:.1f}%",
         f"Rata-rata confidence trade: {average_confidence:.1f}%",
-    ]
+    ])
 
     buckets = summary.get("confidence_buckets") or []
     if buckets:
@@ -1097,6 +1114,23 @@ if __name__ == "__main__":
         "Signal tracker aktif | database=%s",
         database_path,
     )
+
+    # Reset statistik (opsional, lewat env STATS_SINCE). Sinyal yang masih
+    # OPEN dari sebelum titik nol ditutup di sini supaya (a) hasilnya tidak
+    # mencemari statistik baru, dan (b) tidak mengunci pair-nya lewat aturan
+    # anti-duplikat. Idempoten -- aman kalau worker restart berkali-kali.
+    try:
+        archived = archive_signals_before_epoch()
+        if archived:
+            logger.info(
+                "Reset statistik | %s sinyal lama diarsipkan "
+                "(ARCHIVED_PRE_RESET, tidak dihitung menang/kalah)",
+                archived,
+            )
+    except Exception:
+        logger.exception(
+            "Gagal mengarsipkan sinyal lama, bot tetap dilanjutkan."
+        )
 
     app = (
         ApplicationBuilder()
