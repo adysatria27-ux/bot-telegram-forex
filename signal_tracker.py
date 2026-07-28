@@ -330,6 +330,19 @@ def _json_dumps(value: Any) -> str:
     )
 
 
+def _safe_json_object(value: Any) -> dict[str, Any]:
+    """Membaca kolom JSON secara toleran; isi rusak diperlakukan kosong."""
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def _safe_float(value: Any) -> Optional[float]:
     """Konversi float yang mengembalikan None untuk nilai tidak valid."""
     if value is None:
@@ -508,6 +521,25 @@ def initialize_database() -> Path:
             COMMIT;
             """
         )
+        # Migrasi aditif: kolom baru ditambahkan hanya kalau belum ada.
+        # Dipilih ALTER TABLE (bukan ubah CREATE TABLE) supaya database
+        # produksi di volume Railway tidak perlu dibuat ulang dan seluruh
+        # riwayat trade lama tetap utuh.
+        existing_columns = {
+            str(column["name"])
+            for column in connection.execute(
+                "PRAGMA table_info(analyses)"
+            ).fetchall()
+        }
+        if "realized_r" not in existing_columns:
+            connection.execute(
+                "ALTER TABLE analyses ADD COLUMN realized_r REAL"
+            )
+            logger.info(
+                "Kolom realized_r ditambahkan ke tabel analyses "
+                "(migrasi partial close)."
+            )
+
         connection.execute(
             f"PRAGMA user_version = {_SCHEMA_VERSION}"
         )
@@ -670,6 +702,18 @@ def record_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
         # (sebelum perubahan ini) tidak punya key ini -> diagnostik
         # menampilkannya sebagai "-".
         "overextension_ratio_pct": analysis.get("overextension_ratio_pct"),
+        # Bobot partial close DISIMPAN PER TRADE, bukan dibaca dari konfigurasi
+        # saat menghitung. Kalau bobot diubah lewat env di kemudian hari,
+        # trade lama tetap dinilai dengan bobot yang berlaku saat dibuka --
+        # supaya riwayat R tidak berubah retroaktif.
+        "partial_weights": [
+            float(item.get("weight") or 0.0)
+            for item in (analysis.get("partial_plan") or [])
+        ],
+        # Gate pemblokir untuk analisis yang berakhir HOLD. Inilah yang
+        # memungkinkan /diag menjawab "gate mana yang paling sering
+        # menahan sinyal" dengan angka.
+        "hold_blockers": analysis.get("hold_blockers") or [],
         "cache_hit": analysis.get("cache_hit", False),
         "cache_age_seconds": analysis.get(
             "cache_age_seconds",
@@ -951,6 +995,101 @@ def _closed_outcome_after_sl(max_tp_hit: int) -> str:
     return f"SL_AFTER_TP{max_tp_hit}"
 
 
+def _partial_weights_from_metadata(
+    metadata: Any,
+) -> tuple[float, float, float]:
+    """
+    Bobot partial close milik satu trade, dinormalisasi ke jumlah 1.0.
+
+    Trade yang dibuka SEBELUM fitur partial close tidak punya key ini. Untuk
+    trade seperti itu dikembalikan (0, 0, 1) = seluruh posisi ditutup di TP3,
+    yaitu perilaku lama persis. Riwayat lama karena itu tidak berubah
+    nilainya, dan perbandingan sebelum/sesudah tetap jujur.
+    """
+    fallback = (0.0, 0.0, 1.0)
+
+    if not isinstance(metadata, dict):
+        return fallback
+
+    weights = metadata.get("partial_weights")
+    if not isinstance(weights, (list, tuple)) or len(weights) < 3:
+        return fallback
+
+    try:
+        values = [max(0.0, float(weight)) for weight in weights[:3]]
+    except (TypeError, ValueError):
+        return fallback
+
+    total = sum(values)
+    if total <= 0:
+        return fallback
+
+    return (values[0] / total, values[1] / total, values[2] / total)
+
+
+def _realized_r(
+    signal: str,
+    entry: float,
+    risk: float,
+    rr_ladder: tuple[Optional[float], Optional[float], Optional[float]],
+    weights: tuple[float, float, float],
+    max_tp_hit: int,
+    exit_price: Optional[float],
+    breakeven: bool,
+) -> Optional[float]:
+    """
+    Menghitung hasil trade dalam satuan R dengan memperhitungkan partial close.
+
+    Ini perbaikan akuntansi, BUKAN perubahan aturan keluar. Mesin exit di
+    update_open_signals tidak diubah sama sekali: SL tetap SL, breakeven
+    tetap breakeven, TP3 tetap menutup trade. Yang berubah hanya cara hasil
+    dinilai.
+
+    Sebelumnya tracker hanya mengenal "TP3 penuh atau tidak sama sekali",
+    sehingga trade yang menyentuh TP1 lalu berbalik tercatat 0R -- padahal
+    di eksekusi nyata separuh posisi sudah dibukukan di TP1. Dari 40 trade
+    28-29 Jul, 17 trade sudah bergerak untung dan hanya 2 yang tercatat
+    menghasilkan.
+
+    Perhitungan:
+        bagian yang sudah keluar di TPn  -> bobot_n x RR_n
+        sisa posisi                      -> R harga keluar terakhir
+                                            (breakeven = 0, SL = -1,
+                                             expired = selisih nyata)
+    """
+    if risk <= 0:
+        return None
+
+    ladder = [
+        value if isinstance(value, (int, float)) else None
+        for value in rr_ladder
+    ]
+
+    banked = 0.0
+    closed_weight = 0.0
+    for index in range(min(max(max_tp_hit, 0), 3)):
+        level_rr = ladder[index]
+        if level_rr is None:
+            continue
+        banked += weights[index] * float(level_rr)
+        closed_weight += weights[index]
+
+    remaining_weight = max(0.0, 1.0 - closed_weight)
+
+    if remaining_weight <= 0:
+        return round(banked, 4)
+
+    if breakeven:
+        remainder_r = 0.0
+    elif exit_price is None:
+        remainder_r = 0.0
+    else:
+        direction = 1.0 if signal == "BUY" else -1.0
+        remainder_r = direction * (float(exit_price) - entry) / risk
+
+    return round(banked + (remaining_weight * remainder_r), 4)
+
+
 def _breakeven_outcome(max_tp_hit: int) -> str:
     """Nama outcome saat SL breakeven (di entry) tersentuh.
 
@@ -1138,6 +1277,29 @@ def update_open_signals(
                 )
                 counters["expired"] += 1
 
+            # --- Realized R (partial close) --------------------------
+            # Dihitung hanya saat trade benar-benar ditutup. Selama OPEN
+            # nilainya sengaja dibiarkan NULL supaya tidak ada angka
+            # setengah jadi yang ikut masuk ke statistik.
+            realized_r = _safe_float(row["realized_r"])
+            if status == "CLOSED":
+                realized_r = _realized_r(
+                    signal=signal,
+                    entry=entry,
+                    risk=risk,
+                    rr_ladder=(
+                        _safe_float(row["rr1"]),
+                        _safe_float(row["rr2"]),
+                        _safe_float(row["rr3"]),
+                    ),
+                    weights=_partial_weights_from_metadata(
+                        _safe_json_object(row["metadata_json"])
+                    ),
+                    max_tp_hit=max_tp_hit,
+                    exit_price=outcome_price,
+                    breakeven=str(outcome).startswith("BREAKEVEN"),
+                )
+
             changed = (
                 status != row["status"]
                 or outcome != row["outcome"]
@@ -1145,6 +1307,7 @@ def update_open_signals(
                 or abs(mfe - float(row["mfe"] or 0.0)) > 1e-12
                 or abs(mae - float(row["mae"] or 0.0)) > 1e-12
                 or latest_checked != row["latest_checked_candle_time"]
+                or realized_r != _safe_float(row["realized_r"])
             )
 
             if not changed:
@@ -1161,7 +1324,8 @@ def update_open_signals(
                     outcome_price = ?,
                     max_tp_hit = ?,
                     mfe = ?,
-                    mae = ?
+                    mae = ?,
+                    realized_r = ?
                 WHERE id = ?
                 """,
                 (
@@ -1174,6 +1338,7 @@ def update_open_signals(
                     max_tp_hit,
                     mfe,
                     mae,
+                    realized_r,
                     row["id"],
                 ),
             )
@@ -1383,7 +1548,29 @@ def get_performance_summary(days: int = 30) -> dict[str, Any]:
                         THEN confidence
                         ELSE NULL
                     END
-                ) AS average_trade_confidence
+                ) AS average_trade_confidence,
+                -- Ekspektasi dalam satuan R. Ini metrik paling jujur yang
+                -- dimiliki sistem: win rate memperlakukan breakeven sebagai
+                -- "bukan menang" dan trade partial sebagai kalah penuh,
+                -- sedangkan total R menghitung yang benar-benar dibukukan.
+                SUM(
+                    CASE
+                        WHEN signal IN ('BUY', 'SELL')
+                         AND status = 'CLOSED'
+                         AND realized_r IS NOT NULL
+                        THEN realized_r
+                        ELSE 0
+                    END
+                ) AS total_r,
+                SUM(
+                    CASE
+                        WHEN signal IN ('BUY', 'SELL')
+                         AND status = 'CLOSED'
+                         AND realized_r IS NOT NULL
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS scored_trades
             FROM analyses
             WHERE created_at >= ?
             """,
@@ -1404,7 +1591,21 @@ def get_performance_summary(days: int = 30) -> dict[str, Any]:
                 SUM(CASE WHEN max_tp_hit >= 1 THEN 1 ELSE 0 END)
                     AS tp1_or_better,
                 SUM(CASE WHEN outcome = 'SL' THEN 1 ELSE 0 END)
-                    AS direct_sl
+                    AS direct_sl,
+                SUM(
+                    CASE
+                        WHEN status = 'CLOSED' AND realized_r IS NOT NULL
+                        THEN realized_r
+                        ELSE 0
+                    END
+                ) AS bucket_total_r,
+                SUM(
+                    CASE
+                        WHEN status = 'CLOSED' AND realized_r IS NOT NULL
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS bucket_scored
             FROM analyses
             WHERE created_at >= ?
               AND signal IN ('BUY', 'SELL')
@@ -1447,6 +1648,7 @@ def get_performance_summary(days: int = 30) -> dict[str, Any]:
         "expired",
         "completed_tp1_or_better",
         "completed_wins",
+        "scored_trades",
     )
     for field in _COUNT_FIELDS:
         if field in summary:
@@ -1460,6 +1662,21 @@ def get_performance_summary(days: int = 30) -> dict[str, Any]:
         summary.get("completed_tp1_or_better") or 0
     )
     completed_wins = int(summary.get("completed_wins") or 0)
+
+    # --- Ekspektasi R -------------------------------------------------
+    # expectancy_r adalah rata-rata R per trade yang sudah selesai. Inilah
+    # angka yang menentukan apakah sistem menghasilkan uang atau tidak;
+    # win rate bisa terlihat rendah sementara ekspektasi positif (dan
+    # sebaliknya). Trade lama yang ditutup sebelum kolom realized_r ada
+    # tidak punya nilai dan sengaja TIDAK diperhitungkan -- lebih baik
+    # sampel lebih kecil daripada angka yang dikarang.
+    total_r = float(summary.get("total_r") or 0.0)
+    scored_trades = int(summary.get("scored_trades") or 0)
+    summary["total_r"] = round(total_r, 2)
+    summary["scored_trades"] = scored_trades
+    summary["expectancy_r"] = (
+        round(total_r / scored_trades, 3) if scored_trades > 0 else 0.0
+    )
 
     summary["days"] = safe_days
     # Titik nol statistik, supaya laporan Telegram bisa menyatakan terus
@@ -1498,12 +1715,98 @@ def get_performance_summary(days: int = 30) -> dict[str, Any]:
     summary["breakeven_pre_tp1"] = int(
         summary.get("breakeven_pre_tp1") or 0
     )
-    summary["confidence_buckets"] = [
-        dict(bucket_row)
-        for bucket_row in bucket_rows
-    ]
+    # Bucket confidence kini juga membawa ekspektasi R-nya sendiri. Selama
+    # ini bucket hanya menampilkan "berapa persen menyentuh TP1", dan itu
+    # tidak cukup untuk memutuskan ambang: bucket bisa sering menyentuh TP1
+    # tapi tetap merugi, atau jarang menyentuh TP1 tapi menguntungkan karena
+    # pemenangnya besar. Dengan kolom R di sini, kalibrasi ambang berikutnya
+    # bisa memakai angka yang benar.
+    buckets = []
+    for bucket_row in bucket_rows:
+        bucket = dict(bucket_row)
+        bucket_scored = int(bucket.pop("bucket_scored", 0) or 0)
+        bucket_total_r = float(bucket.pop("bucket_total_r", 0.0) or 0.0)
+        bucket["scored_trades"] = bucket_scored
+        bucket["total_r"] = round(bucket_total_r, 2)
+        bucket["expectancy_r"] = (
+            round(bucket_total_r / bucket_scored, 3)
+            if bucket_scored > 0
+            else None
+        )
+        buckets.append(bucket)
+
+    summary["confidence_buckets"] = buckets
     summary["database_path"] = str(get_database_path())
     return summary
+
+
+def get_hold_blocker_census(days: int = 30) -> dict[str, Any]:
+    """
+    Menghitung gate mana yang paling sering mengubah sinyal menjadi HOLD.
+
+    Read-only, tidak menyentuh logika trading. Ini jawaban berbasis angka
+    untuk pertanyaan "kenapa HOLD terus": selama ini setiap HOLD tercatat
+    tanpa sebab, sehingga pelonggaran ambang hanya bisa dilakukan dengan
+    menebak. Dengan sensus ini, gate yang paling sering memblokir bisa
+    dilonggarkan secara terarah -- satu gate, dengan alasan, lalu diukur.
+
+    Catatan: hanya analisis yang direkam SETELAH fitur ini aktif yang punya
+    data. HOLD lama tercatat sebagai 'tanpa_data' dan tidak dipaksa masuk ke
+    kategori mana pun.
+    """
+    initialize_database()
+
+    safe_days = max(1, min(int(days), 3650))
+    start_time = _report_start_time(safe_days)
+
+    counts: dict[str, int] = {}
+    holds_with_data = 0
+    holds_without_data = 0
+    near_miss = 0
+
+    with _connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT confidence, metadata_json
+            FROM analyses
+            WHERE created_at >= ?
+              AND signal = 'HOLD'
+            """,
+            (start_time,),
+        ).fetchall()
+
+    for row in rows:
+        metadata = _safe_json_object(row["metadata_json"])
+        blockers = metadata.get("hold_blockers")
+
+        if not isinstance(blockers, list) or not blockers:
+            holds_without_data += 1
+            continue
+
+        holds_with_data += 1
+
+        # "Nyaris lolos" = hanya SATU gate yang menahan. Kelompok ini yang
+        # paling berharga: melonggarkan satu gate akan langsung mengubahnya
+        # menjadi sinyal, tanpa menyentuh gate lain.
+        if len(blockers) == 1:
+            near_miss += 1
+
+        for blocker in blockers:
+            key = str(blocker)
+            counts[key] = counts.get(key, 0) + 1
+
+    ranked = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+
+    return {
+        "days": safe_days,
+        "holds_total": len(rows),
+        "holds_with_data": holds_with_data,
+        "holds_without_data": holds_without_data,
+        "near_miss_single_gate": near_miss,
+        "blockers": [
+            {"gate": gate, "count": count} for gate, count in ranked
+        ],
+    }
 
 
 def get_direct_sl_diagnostics(days: int = 30) -> dict[str, Any]:
