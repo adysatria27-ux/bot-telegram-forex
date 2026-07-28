@@ -731,7 +731,23 @@ def _format_hold_blockers(census: dict) -> str:
     if without_data:
         lines.append(f"HOLD lama (tanpa data): {without_data}")
 
-    lines.extend(["", "Gate pemblokir (satu HOLD bisa kena beberapa):"])
+    primary = census.get("primary_blockers") or []
+    if primary:
+        lines.extend(["", "PENYEBAB UTAMA (gate pertama yang gagal):"])
+        for item in primary:
+            gate = str(item.get("gate"))
+            count = int(item.get("count") or 0)
+            share = (count / with_data * 100) if with_data else 0.0
+            lines.append(
+                f"• {label.get(gate, gate)}: {count} ({share:.0f}%)"
+            )
+        lines.append(
+            "Inilah yang harus dibenahi. Gate di bawah sering hanya "
+            "akibat: kalau skor arah belum tembus, confidence otomatis "
+            "ikut gagal — menurunkan ambang confidence tidak menolong."
+        )
+
+    lines.extend(["", "Semua gate (satu HOLD bisa kena beberapa):"])
     for item in blockers:
         gate = str(item.get("gate"))
         count = int(item.get("count") or 0)
