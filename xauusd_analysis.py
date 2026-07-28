@@ -420,7 +420,32 @@ TIMEFRAME_BIAS_THRESHOLD = 0.15
 MIN_TIMEFRAMES_FOR_SIGNAL = 3
 MIN_COVERAGE_RATIO = 0.65
 MIN_DIRECTIONAL_AGREEMENT = 0.65
-MIN_CONFIDENCE_FOR_SIGNAL = 60.0
+# === DINAIKKAN 2026-07-28: 60.0 -> 72.0 ===================================
+# Selama 3 snapshot pertama (sample 19-27 trade) bucket confidence terlihat
+# TERBALIK (70-79 menang lebih sering daripada 80-100), dan kesimpulan waktu
+# itu adalah "jangan sentuh ambang, sample terlalu kecil". Keputusan itu
+# benar untuk saat itu. Dengan n=136 pada 2026-07-28, inversi itu terbukti
+# artefak sample kecil -- hubungannya sekarang monoton:
+#
+#   bucket 60-69 : 60 sinyal (44% dari semua!) -> sentuh TP1 10.0%
+#   bucket 70-79 : 52 sinyal               -> sentuh TP1 17.3%
+#   bucket 80-89 : 18 sinyal               -> sentuh TP1 27.8%
+#   bucket 90-100:  6 sinyal               -> 16.7% (n=6, masih noise)
+#
+# Artinya confidence SUDAH bekerja sebagai peringkat kualitas; yang salah
+# cuma ambang lolosnya. Hampir separuh sinyal berasal dari bucket terburuk,
+# dan bucket itu punya ekspektasi jelas negatif. Membuang bucket 60-69
+# memangkas ~44% sinyal dan membuang bagian distribusi yang paling merugi.
+#
+# Catatan jujur: ini MENGURANGI jumlah sinyal, berlawanan dengan keinginan
+# "sinyal lebih sering". Tapi data pemiliknya sendiri menunjukkan bot
+# profitable (+0.78R/trade) saat mengeluarkan 27 sinyal/30 hari, dan rugi
+# (-0.28R/trade) saat mengeluarkan 136. Sinyal marginal di sistem ini
+# berekspektasi negatif; menambahnya mempercepat kerugian.
+#
+# Dibuat env-driven supaya kalibrasi berikutnya tidak perlu ubah kode:
+# set MIN_CONFIDENCE_FOR_SIGNAL=65 (lebih longgar) atau =78 (lebih ketat).
+MIN_CONFIDENCE_FOR_SIGNAL = 72.0
 
 # Konfigurasi price action dan market structure.
 SWING_WINDOW = 2
@@ -476,6 +501,17 @@ def _env_float(name: str, default: float) -> float:
     except ValueError:
         logger.warning("Env %s bukan angka valid: %s", name, raw)
         return default
+
+
+# Override ambang confidence lewat environment variable. Ditulis DI SINI
+# (bukan di baris deklarasi di atas) karena _env_float baru terdefinisi
+# setelah blok konstanta. Nilai di atas tetap menjadi default bila env
+# tidak diisi. Dibatasi ke rentang wajar supaya salah ketik di Railway
+# tidak mematikan bot atau membuka keran sinyal sampai nol filter.
+MIN_CONFIDENCE_FOR_SIGNAL = min(
+    95.0,
+    max(50.0, _env_float("MIN_CONFIDENCE_FOR_SIGNAL", MIN_CONFIDENCE_FOR_SIGNAL)),
+)
 
 
 # =============================================================================
