@@ -157,6 +157,115 @@ BREAKEVEN_AT_MFE_R = _env_float("BREAKEVEN_AT_MFE_R", 0.0)
 ALLOW_DUPLICATE_OPEN = _env_flag("ALLOW_DUPLICATE_OPEN", False)
 
 
+# === TITIK NOL STATISTIK (baru 2026-07-28) ==================================
+# Masalah: data historis (per 28 Jul: 514 analisis, 136 sinyal, 123 selesai)
+# dihasilkan oleh rezim yang sudah terbukti rusak -- breakeven-dini memotong
+# semua pemenang jadi 0R, dan scanner mencatat sinyal duplikat tiap siklus
+# sehingga satu setup dihitung belasan kali. Angka apa pun yang dihitung dari
+# campuran data lama + baru akan menyesatkan untuk waktu yang lama, karena
+# data lama jumlahnya jauh lebih banyak dan akan mendominasi rata-rata.
+#
+# SENGAJA TIDAK MENGHAPUS DATA. Penghapusan tidak bisa dibatalkan, dan kalau
+# hipotesis soal breakeven-dini ternyata keliru, histori itu satu-satunya
+# pembanding yang kita punya. Jadi pendekatannya: beri tanda titik nol.
+# Baris lama tetap ada di database, cuma tidak dihitung oleh laporan.
+#
+# Cara pakai: set env STATS_SINCE ke waktu redeploy, mis.
+#   STATS_SINCE=2026-07-29
+#   STATS_SINCE=2026-07-29T10:30:00
+# Kosongkan (atau hapus env-nya) untuk melihat seluruh histori lagi --
+# reset ini sepenuhnya reversibel, karena tidak ada yang dibuang.
+#
+# Efek keduanya, yang sama pentingnya: sinyal OPEN yang dibuka SEBELUM titik
+# nol akan diarsipkan saat startup (lihat archive_signals_before_epoch).
+# Tanpa itu, 13 posisi OPEN warisan rezim lama akan MEMBLOKIR sinyal baru
+# lewat aturan anti-duplikat, dan hasil akhirnya tetap mencemari statistik.
+STATS_SINCE_RAW = os.getenv("STATS_SINCE", "").strip()
+
+
+def _stats_since() -> Optional[datetime]:
+    """Membaca titik nol statistik dari env. None = hitung semua histori."""
+    if not STATS_SINCE_RAW:
+        return None
+
+    parsed = _parse_datetime(STATS_SINCE_RAW)
+    if parsed is None:
+        logger.warning(
+            "STATS_SINCE bukan tanggal yang valid, diabaikan: %s",
+            STATS_SINCE_RAW,
+        )
+        return None
+
+    return parsed
+
+
+def _report_start_time(days: int) -> str:
+    """
+    Menentukan batas awal laporan.
+
+    Diambil yang PALING BARU antara jendela hari yang diminta dan titik nol
+    STATS_SINCE. Dengan begitu `/stats 30 hari` tidak bisa diam-diam menarik
+    kembali data dari rezim lama yang sudah direset.
+    """
+    safe_days = max(1, min(int(days), 3650))
+    window_start = _utc_now() - timedelta(days=safe_days)
+
+    epoch = _stats_since()
+    if epoch is not None and epoch > window_start:
+        return _to_iso(epoch)
+
+    return _to_iso(window_start)
+
+
+def archive_signals_before_epoch() -> int:
+    """
+    Menutup sinyal yang masih OPEN dari sebelum titik nol.
+
+    Dijalankan sekali saat startup. Sinyal warisan rezim lama ditutup dengan
+    outcome ARCHIVED_PRE_RESET -- BUKAN sebagai menang maupun kalah, karena
+    hasilnya memang tidak pernah diketahui dan tidak boleh dinilai.
+
+    Alasan ini perlu: aturan anti-duplikat memblokir sinyal searah selama
+    masih ada posisi OPEN. Posisi lama yang menggantung akan mengunci pair
+    itu sampai kedaluwarsa, sehingga bot tampak "tidak pernah memberi sinyal"
+    padahal analisisnya jalan.
+
+    Aman dipanggil berulang kali (idempoten): setelah diarsipkan, statusnya
+    bukan OPEN lagi sehingga tidak tersentuh pemanggilan berikutnya.
+    """
+    epoch = _stats_since()
+    if epoch is None:
+        return 0
+
+    initialize_database()
+    now_iso = _to_iso(_utc_now())
+
+    with _connect() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE analyses
+            SET status = 'CLOSED',
+                outcome = 'ARCHIVED_PRE_RESET',
+                outcome_at = ?,
+                updated_at = ?
+            WHERE status = 'OPEN'
+              AND created_at < ?
+            """,
+            (now_iso, now_iso, _to_iso(epoch)),
+        )
+        archived = cursor.rowcount or 0
+
+    if archived:
+        logger.info(
+            "Sinyal lama diarsipkan karena reset statistik | jumlah=%s | "
+            "titik_nol=%s",
+            archived,
+            _to_iso(epoch),
+        )
+
+    return archived
+
+
 def _utc_now() -> datetime:
     """Menghasilkan waktu UTC yang timezone-aware."""
     return datetime.now(timezone.utc)
@@ -1199,9 +1308,7 @@ def get_performance_summary(days: int = 30) -> dict[str, Any]:
     initialize_database()
 
     safe_days = max(1, min(int(days), 3650))
-    start_time = _to_iso(
-        _utc_now() - timedelta(days=safe_days)
-    )
+    start_time = _report_start_time(safe_days)
 
     with _connect() as connection:
         row = connection.execute(
@@ -1315,6 +1422,39 @@ def get_performance_summary(days: int = 30) -> dict[str, Any]:
         ).fetchall()
 
     summary = dict(row) if row is not None else {}
+
+    # SQLite mengembalikan NULL (bukan 0) untuk SUM() di atas himpunan
+    # kosong. Sebelum ada reset statistik, kondisi itu praktis tidak pernah
+    # terjadi karena database selalu berisi data. Setelah STATS_SINCE
+    # dipakai, `/stats` pertama pasca-reset memang menghitung nol baris --
+    # dan seluruh agregat jadi None. Formatter Telegram kebetulan aman
+    # (`int(x or 0)`), tapi konsumen lain (Web API, kalkulasi bucket)
+    # belum tentu. Dinormalkan sekali di sini supaya kontrak fungsi ini
+    # selalu mengembalikan angka, bukan campuran angka dan None.
+    _COUNT_FIELDS = (
+        "total_analyses",
+        "holds",
+        "trade_signals",
+        "open_trades",
+        "completed_trades",
+        "tp1_or_better",
+        "tp2_or_better",
+        "tp3_hits",
+        "direct_sl",
+        "sl_after_tp",
+        "breakeven_after_tp",
+        "breakeven_pre_tp1",
+        "expired",
+        "completed_tp1_or_better",
+        "completed_wins",
+    )
+    for field in _COUNT_FIELDS:
+        if field in summary:
+            summary[field] = int(summary[field] or 0)
+
+    if summary.get("average_trade_confidence") is None:
+        summary["average_trade_confidence"] = 0.0
+
     completed = int(summary.get("completed_trades") or 0)
     completed_tp1_or_better = int(
         summary.get("completed_tp1_or_better") or 0
@@ -1322,6 +1462,10 @@ def get_performance_summary(days: int = 30) -> dict[str, Any]:
     completed_wins = int(summary.get("completed_wins") or 0)
 
     summary["days"] = safe_days
+    # Titik nol statistik, supaya laporan Telegram bisa menyatakan terus
+    # terang bahwa angkanya dihitung sejak reset -- bukan sepanjang histori.
+    epoch = _stats_since()
+    summary["stats_since"] = _to_iso(epoch) if epoch is not None else None
 
     # tp1_hit_rate_pct: dari trade yang SUDAH SELESAI (CLOSED), berapa persen
     # yang sempat menyentuh TP1 atau lebih. Pembilang dan penyebut kini SAMA-SAMA
@@ -1401,7 +1545,7 @@ def get_direct_sl_diagnostics(days: int = 30) -> dict[str, Any]:
     initialize_database()
 
     safe_days = max(1, min(int(days), 3650))
-    start_time = _to_iso(_utc_now() - timedelta(days=safe_days))
+    start_time = _report_start_time(safe_days)
 
     with _connect() as connection:
         rows = connection.execute(
@@ -1538,7 +1682,7 @@ def get_direction_census(days: int = 30) -> dict[str, Any]:
     initialize_database()
 
     safe_days = max(1, min(int(days), 3650))
-    start_time = _to_iso(_utc_now() - timedelta(days=safe_days))
+    start_time = _report_start_time(safe_days)
 
     with _connect() as connection:
         row = connection.execute(
