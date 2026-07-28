@@ -30,6 +30,7 @@ from xauusd_analysis import (
 )
 
 from signal_tracker import (
+    get_hold_blocker_census,
     initialize_database,
     archive_signals_before_epoch,
     record_analysis,
@@ -390,6 +391,30 @@ def _format_tracker_stats(
         f"Rata-rata confidence trade: {average_confidence:.1f}%",
     ])
 
+    # Ekspektasi R ditempatkan menonjol karena inilah satu-satunya angka
+    # yang menentukan sistem ini menghasilkan uang atau tidak. Win rate bisa
+    # 5% dan tetap untung, atau 60% dan tetap rugi -- tergantung ukuran
+    # menang vs kalah, dan hanya R yang mengukurnya.
+    scored_trades = int(summary.get("scored_trades") or 0)
+    if scored_trades > 0:
+        total_r = float(summary.get("total_r") or 0.0)
+        expectancy_r = float(summary.get("expectancy_r") or 0.0)
+        if total_r > 0:
+            verdict = "PROFIT"
+        elif total_r == 0:
+            verdict = "IMPAS"
+        else:
+            verdict = "RUGI"
+        lines.extend(
+            [
+                "",
+                f"💰 Total R: {total_r:+.2f}R  ({verdict})",
+                f"Ekspektasi: {expectancy_r:+.3f}R per trade "
+                f"({scored_trades} trade dinilai)",
+                "Sudah termasuk partial close di TP1/TP2.",
+            ]
+        )
+
     buckets = summary.get("confidence_buckets") or []
     if buckets:
         lines.extend(["", "Confidence Buckets (open + selesai):"])
@@ -397,9 +422,15 @@ def _format_tracker_stats(
             signals = int(bucket.get("signals") or 0)
             wins = int(bucket.get("tp1_or_better") or 0)
             rate = (wins / signals * 100) if signals else 0.0
+            expectancy = bucket.get("expectancy_r")
+            expectancy_text = (
+                f" | {float(expectancy):+.2f}R/trade"
+                if isinstance(expectancy, (int, float))
+                else ""
+            )
             lines.append(
                 f"• {bucket.get('bucket')}: {wins}/{signals} "
-                f"mencapai TP1+ ({rate:.1f}%)"
+                f"mencapai TP1+ ({rate:.1f}%){expectancy_text}"
             )
 
     lines.extend(
@@ -620,18 +651,107 @@ def _format_direction_census(census: dict) -> str:
         lines.append(f"• Porsi BUY: {buy_share:.0f}% | SELL: {100 - buy_share:.0f}%")
 
     lines.append("")
-    if sell_total == 0 and buy_total > 0:
+    # BUG DIPERBAIKI 2026-07-29: peringatan sebelumnya HANYA memeriksa bias
+    # BUY. Saat 40 dari 40 sinyal berupa SELL, bot justru mencetak
+    # "Distribusi arah relatif seimbang" -- menyembunyikan fakta terpenting
+    # periode itu. Pemeriksaan sekarang simetris untuk kedua arah.
+    if trade_total == 0:
+        lines.append("Belum ada sinyal BUY/SELL pada periode ini.")
+    elif sell_total == 0:
         lines.append(
             "⚠️ Bot TIDAK PERNAH mengeluarkan SELL pada periode ini — "
             "indikasi bias long. Perlu diselidiki (bukan sekadar tuning)."
         )
-    elif trade_total > 0 and (buy_total / trade_total) >= 0.85:
+    elif buy_total == 0:
         lines.append(
-            "⚠️ Sinyal sangat berat ke BUY (≥85%). Kemungkinan bias long — "
-            "perlu diselidiki."
+            "⚠️ Bot TIDAK PERNAH mengeluarkan BUY pada periode ini — "
+            "indikasi bias short. Perlu diselidiki (bukan sekadar tuning)."
+        )
+    elif (buy_total / trade_total) >= 0.85:
+        lines.append(
+            "⚠️ Sinyal sangat berat ke BUY (≥85%). Praktis satu taruhan yang "
+            "sama diulang berkali-kali — periksa eksposur."
+        )
+    elif (sell_total / trade_total) >= 0.85:
+        lines.append(
+            "⚠️ Sinyal sangat berat ke SELL (≥85%). Praktis satu taruhan yang "
+            "sama diulang berkali-kali — periksa eksposur."
         )
     else:
         lines.append("Distribusi arah relatif seimbang.")
+
+    return "\n".join(lines)
+
+
+def _format_hold_blockers(census: dict) -> str:
+    """
+    Laporan gate mana yang paling sering mengubah sinyal jadi HOLD.
+
+    Ini bagian yang selama ini hilang. Tanpa data ini, satu-satunya cara
+    mengurangi HOLD adalah menurunkan semua ambang sekaligus -- yang berarti
+    ikut memasukkan sinyal buruk. Dengan daftar ini, gate yang paling sering
+    memblokir bisa dilonggarkan satu per satu dan diukur efeknya.
+    """
+    total = int(census.get("holds_total") or 0)
+    with_data = int(census.get("holds_with_data") or 0)
+    without_data = int(census.get("holds_without_data") or 0)
+    near_miss = int(census.get("near_miss_single_gate") or 0)
+    blockers = census.get("blockers") or []
+
+    label = {
+        "arah": "Skor arah belum tembus ambang",
+        "jumlah_timeframe": "Timeframe kurang",
+        "coverage_data": "Data tidak lengkap",
+        "keselarasan_timeframe": "Timeframe tidak sepakat",
+        "confidence": "Confidence di bawah ambang",
+        "market_structure": "Struktur market belum konfirmasi",
+        "sideways": "Pasar sideways",
+        "false_breakout": "False breakout melawan arah",
+        "risk_reward": "Risk Reward tidak memenuhi",
+    }
+
+    lines = [
+        f"🚦 Kenapa HOLD — {census.get('days', 30)} Hari",
+        "",
+        f"Total HOLD: {total}",
+    ]
+
+    if with_data == 0:
+        lines.extend(
+            [
+                "",
+                "Belum ada HOLD yang tercatat dengan data pemblokir.",
+                "Data ini mulai terkumpul untuk analisis BARU setelah versi "
+                "ini aktif — jalankan /diag lagi setelah beberapa jam.",
+            ]
+        )
+        return "\n".join(lines)
+
+    lines.append(f"HOLD dengan data pemblokir: {with_data}")
+    if without_data:
+        lines.append(f"HOLD lama (tanpa data): {without_data}")
+
+    lines.extend(["", "Gate pemblokir (satu HOLD bisa kena beberapa):"])
+    for item in blockers:
+        gate = str(item.get("gate"))
+        count = int(item.get("count") or 0)
+        share = (count / with_data * 100) if with_data else 0.0
+        lines.append(
+            f"• {label.get(gate, gate)}: {count} ({share:.0f}%)"
+        )
+
+    near_share = (near_miss / with_data * 100) if with_data else 0.0
+    lines.extend(
+        [
+            "",
+            f"Nyaris lolos (hanya 1 gate menahan): {near_miss} "
+            f"({near_share:.0f}%)",
+            "Kelompok inilah yang paling murah diubah jadi sinyal: cukup "
+            "longgarkan SATU gate teratas, lalu ukur hasilnya. Menurunkan "
+            "semua ambang sekaligus akan ikut memasukkan sinyal yang "
+            "diblokir oleh beberapa gate — itu justru yang merugikan.",
+        ]
+    )
 
     return "\n".join(lines)
 
@@ -644,8 +764,9 @@ async def diag_command(
     Perintah /diag: diagnostik read-only.
 
     Memperbarui dulu outcome yang masih aktif (sama seperti /stats) supaya
-    data konsisten, lalu mengirim dua bagian: (1) sensus arah BUY/SELL untuk
-    cek bias, (2) pembedahan SL-langsung. Tidak mengubah logika trading.
+    data konsisten, lalu mengirim tiga bagian: (1) sensus arah BUY/SELL untuk
+    cek bias, (2) pembedahan SL-langsung, (3) sensus gate pemblokir HOLD.
+    Tidak mengubah logika trading.
     """
     if update.message is None:
         return
@@ -670,6 +791,14 @@ async def diag_command(
         )
         await update.message.reply_text(
             _format_diag_stats(diag)
+        )
+
+        hold_census = await asyncio.to_thread(
+            get_hold_blocker_census,
+            TRACKER_STATS_DAYS,
+        )
+        await update.message.reply_text(
+            _format_hold_blockers(hold_census)
         )
     except Exception:
         logger.exception("Gagal membuat diagnostik.")
@@ -725,7 +854,15 @@ def _format_alert(analysis: dict) -> str:
     rr1 = analysis.get("risk_reward_tp1")
 
     emoji = "🟢" if signal == "BUY" else "🔴"
-    head_rr = f" | RR TP1 1:{rr1:.2f}" if isinstance(rr1, (int, float)) else ""
+    # Judul menampilkan RR target AKHIR, bukan TP1. Sejak tangga scalping,
+    # TP1 memang berada di 1R; menampilkan "RR 1:1" di judul akan terbaca
+    # seperti trade berkualitas rendah, padahal aturan 1:2 dipenuhi di TP3.
+    rr3_head = analysis.get("risk_reward_tp3")
+    head_rr = (
+        f" | RR 1:{rr3_head:.1f}"
+        if isinstance(rr3_head, (int, float))
+        else ""
+    )
 
     lines = [
         f"🔔 *SINYAL LIVE — {symbol}*",
@@ -736,11 +873,30 @@ def _format_alert(analysis: dict) -> str:
     def _p(value) -> str:
         return f"{value:.{decimals}f}" if isinstance(value, (int, float)) else "-"
 
+    # Rencana partial ikut ditampilkan di alert. Tanpa ini, alert cuma
+    # memberi tiga angka TP tanpa memberitahu berapa persen yang harus
+    # ditutup di mana -- padahal justru pembukuan bertahap itulah inti
+    # perubahan geometri scalping.
+    plan = analysis.get("partial_plan") or []
+    weights = {
+        str(item.get("level")): float(item.get("weight") or 0.0)
+        for item in plan
+    }
+
+    def _tp_line(level: str, value) -> str:
+        weight = weights.get(level)
+        if weight is None:
+            return f"*{level}:* {_p(value)}"
+        return f"*{level}:* {_p(value)}  (tutup {weight * 100:.0f}%)"
+
     lines.extend(
         [
             f"*Entry:* {_p(entry)}",
             f"*SL:* {_p(stop_loss)}",
-            f"*TP1:* {_p(tp1)}  *TP2:* {_p(tp2)}  *TP3:* {_p(tp3)}",
+            _tp_line("TP1", tp1),
+            _tp_line("TP2", tp2),
+            _tp_line("TP3", tp3),
+            "_Setelah TP1 kena, SL geser ke entry._",
             f"*Trend:* {trend} | *Risk:* {risk}",
         ]
     )
