@@ -104,7 +104,19 @@ ALERT_SCAN_SYMBOLS = _env_list(
     ["XAU/USD", "BTC/USD", "EUR/USD", "GBP/USD"],
 )
 # Selang pemindaian (menit).
-ALERT_SCAN_INTERVAL_MINUTES = _env_int("ALERT_SCAN_INTERVAL_MINUTES", 15)
+# === DINAIKKAN 2026-07-28: 15 -> 30 =======================================
+# Hitungan kuota: 4 pair x 4 timeframe = 16 request per siklus.
+#   interval 15 menit -> 96 siklus/hari x 16 = ~1.536 request/hari
+#   interval 30 menit -> 48 siklus/hari x 16 = ~768 request/hari
+# Paket gratis Twelve Data hanya 800 request/hari. Dengan interval 15 menit
+# kuota habis sekitar tengah hari; setelah itu _fetch_ohlc kena HTTP 429,
+# get_market_data melempar RuntimeError, dan _scan_once menangkapnya lalu
+# melewati pair itu DIAM-DIAM. Efek yang dirasakan pemilik bot: "alert sudah
+# dinyalakan tapi sinyal jarang keluar" -- padahal penyebabnya bukan HOLD
+# kebanyakan, melainkan scanner mati separuh hari karena kuota.
+# 30 menit muat di kuota gratis dengan sisa aman untuk analisis manual.
+# Kalau paketnya berbayar, set ALERT_SCAN_INTERVAL_MINUTES=15 lewat env.
+ALERT_SCAN_INTERVAL_MINUTES = _env_int("ALERT_SCAN_INTERVAL_MINUTES", 30)
 # Confidence minimum agar sebuah sinyal dialert. 0 = semua yang lolos gate bot.
 ALERT_MIN_CONFIDENCE = _env_float("ALERT_MIN_CONFIDENCE", 0.0)
 # Jeda anti-spam per pair (menit): sinyal arah sama tidak dialert ulang
@@ -225,11 +237,16 @@ async def _refresh_tracker_symbol(symbol: str) -> dict[str, int]:
 async def _track_analysis(
     symbol: str,
     analysis: dict,
-) -> None:
+) -> dict:
     """
     Memperbarui outcome lama lalu mencatat analisis baru.
 
     Kegagalan tracker tidak boleh menggagalkan pesan analisis Telegram.
+
+    Mengembalikan hasil pencatatan supaya pemanggil (terutama scanner) bisa
+    tahu apakah sinyal benar-benar dibuka atau ditolak sebagai duplikat.
+    Dict kosong berarti tracker gagal -- pemanggil harus memperlakukannya
+    sebagai "tidak diketahui", bukan sebagai duplikat.
     """
     try:
         tracker_update = await _refresh_tracker_symbol(symbol)
@@ -240,19 +257,22 @@ async def _track_analysis(
 
         logger.info(
             "Signal tracker selesai | symbol=%s | analysis_id=%s | "
-            "inserted=%s | checked=%s | closed=%s",
+            "inserted=%s | skipped=%s | checked=%s | closed=%s",
             symbol,
             log_result.get("id"),
             log_result.get("inserted"),
+            log_result.get("skipped_reason"),
             tracker_update.get("checked", 0),
             tracker_update.get("closed", 0),
         )
+        return log_result
     except Exception:
         logger.exception(
             "Signal tracker gagal, analisis Telegram tetap dilanjutkan | "
             "symbol=%s",
             symbol,
         )
+        return {}
 
 
 async def _refresh_all_open_signals() -> None:
@@ -798,9 +818,42 @@ async def _scan_once(application) -> None:
     for symbol in ALERT_SCAN_SYMBOLS:
         try:
             analysis = await get_market_data(symbol)
-            await _track_analysis(symbol, analysis)
-        except Exception:
-            logger.exception("Scanner gagal menganalisis | symbol=%s", symbol)
+            track_result = await _track_analysis(symbol, analysis)
+
+            # Kalau sinyal ditolak karena posisi searah masih OPEN, jangan
+            # kirim alert. Tanpa ini pemilik bot akan menerima notifikasi
+            # untuk trade yang tidak pernah dicatat -- dan kalau dieksekusi,
+            # justru menciptakan kembali overexposure yang ingin dicegah.
+            if track_result.get("skipped_reason") == "duplicate_open":
+                logger.info(
+                    "Alert dilewati, posisi searah masih terbuka | "
+                    "symbol=%s | signal=%s",
+                    symbol,
+                    analysis.get("signal"),
+                )
+                await asyncio.sleep(ALERT_PAIR_DELAY_SECONDS)
+                continue
+        except Exception as exc:
+            # Kegagalan kuota/rate-limit sebelumnya tercampur dengan error
+            # biasa dan terlihat seperti "bot diam saja". Dibedakan supaya
+            # penyebab "alert nyala tapi sinyal jarang keluar" langsung
+            # terbaca di log Railway tanpa perlu membedah kode.
+            detail = str(exc).lower()
+            if any(
+                mark in detail
+                for mark in ("429", "rate limit", "limit", "quota", "credits")
+            ):
+                logger.error(
+                    "SCANNER BERHENTI KARENA KUOTA API | symbol=%s | %s | "
+                    "Naikkan ALERT_SCAN_INTERVAL_MINUTES atau kurangi "
+                    "ALERT_SCAN_SYMBOLS lewat env.",
+                    symbol,
+                    exc,
+                )
+            else:
+                logger.exception(
+                    "Scanner gagal menganalisis | symbol=%s", symbol
+                )
             await asyncio.sleep(ALERT_PAIR_DELAY_SECONDS)
             continue
 
