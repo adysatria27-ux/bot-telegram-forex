@@ -95,14 +95,66 @@ BREAKEVEN_AFTER_TP1 = _env_flag("BREAKEVEN_AFTER_TP1", True)
 # SL-langsung historis (Bapak): ambang 1.0R menyelamatkan 3 trade (+3R),
 # ambang lebih rendah (0.5R) menyelamatkan lebih banyak (+6R) tapi lebih
 # berisiko memotong calon pemenang yang masih dalam pullback wajar.
-# TRADE-OFF YANG HARUS DIPANTAU: mekanisme ini bisa menutup SEBAGIAN
-# pemenang di breakeven (0R) padahal kalau dibiarkan bisa lanjut ke TP --
-# biaya di sisi pemenang belum terukur presisi (lihat rancangan geometri
-# SL/TP). Pantau /stats: kalau TP2/TP3 hit-rate terlihat turun drastis
-# dibanding sebelum ini aktif, naikkan ambang (mis. 1.5) atau matikan
-# (set ke 0) lewat environment variable BREAKEVEN_AT_MFE_R -- tanpa perlu
-# ubah kode/redeploy.
-BREAKEVEN_AT_MFE_R = _env_float("BREAKEVEN_AT_MFE_R", 1.0)
+# === DIMATIKAN 2026-07-28 (default 1.0 -> 0.0). BUKTI, BUKAN DUGAAN. ===
+# Kondisi pemicu yang ditulis di komentar versi sebelumnya ("kalau TP2/TP3
+# hit-rate turun drastis dibanding sebelum ini aktif, naikkan ambang atau
+# matikan") TERPENUHI secara ekstrem pada snapshot /stats 2026-07-28:
+#
+#   24 Jul (27 trade selesai): 9 TP3, 12 SL. Ekspektasi +0.78R per trade.
+#   28 Jul (123 trade selesai): 9 TP3, 68 SL, 35 BE-dini. -0.28R per trade.
+#   Artinya: dari 96 trade BARU sejak lever ini aktif, NOL yang mencapai
+#   TP3, sementara 35 trade ditutup impas di 0R.
+#
+# Penyebabnya matematis, bukan soal kalibrasi angka:
+#   risk 1R = 1.5 x ATR(M15); trigger BE = 1.0R = 1.5 ATR; TP1 = 2R = 3 ATR.
+#   Supaya menang, harga harus maju 1.5 ATR, LALU TIDAK BOLEH pullback
+#   1.5 ATR, lalu maju 1.5 ATR lagi. Pullback sebesar itu setelah maju
+#   sebesar itu adalah perilaku M15 yang paling normal. Jadi lever ini
+#   memotong seluruh ekor kanan distribusi (pemenang -> 0R) sementara ekor
+#   kiri (-1R) dibiarkan utuh. Untuk sistem yang edge-nya ada di TP3 (+4R),
+#   itu dijamin negatif berapa pun bagusnya kualitas entry.
+#
+# KESIMPULAN DESAIN: breakeven berbasis R-multiple tidak kompatibel dengan
+# TP1 di 2R. Proteksi pre-TP1 yang benar harus berbasis STRUKTUR (trailing
+# ke swing low/high terakhir), bukan jarak R tetap -- itu rencana P2, bukan
+# tambalan sekarang.
+#
+# Breakeven SETELAH TP1 (BREAKEVEN_AFTER_TP1 di atas) TETAP AKTIF. Lever itu
+# terbukti benar dan tidak pernah memotong pemenang, karena baru berlaku
+# setelah target pertama tercapai.
+#
+# Reversibel: set env BREAKEVEN_AT_MFE_R=1.0 untuk mengembalikan perilaku
+# lama tanpa ubah kode. Nilai <= 0 mematikan lever ini sepenuhnya.
+BREAKEVEN_AT_MFE_R = _env_float("BREAKEVEN_AT_MFE_R", 0.0)
+
+
+# === ANTI-DUPLIKAT POSISI (baru 2026-07-28) ==================================
+# Masalah yang diserang: sejak Live Scanner aktif, `_scan_once()` memanggil
+# `_track_analysis()` SETIAP siklus (default tiap 15 menit) SEBELUM cek
+# cooldown alert. Cooldown 60 menit hanya menahan NOTIFIKASI Telegram, tidak
+# menahan PENCATATAN trade. Sementara dedup fingerprint memakai
+# reference_candle_time (waktu candle M15) yang selalu berubah tiap siklus,
+# sehingga fingerprint tidak pernah bentrok.
+#
+# Akibatnya satu tren yang berjalan 5 jam melahirkan ~20 posisi BUY pada ide
+# yang sama persis, di harga yang makin lama makin buruk. Saat tren berbalik,
+# semuanya kena SL bersamaan. Ini merusak dua hal sekaligus:
+#   1. STATISTIK -- 123 "trade" bukan 123 sampel independen, mungkin cuma
+#      15-25 setup nyata yang dihitung berulang. Semua kesimpulan kalibrasi
+#      dari angka itu terlalu percaya diri.
+#   2. RISIKO NYATA -- kalau tiap alert dieksekusi, itu overexposure ~20x
+#      pada satu ide. Satu pembalikan menghabiskan akun.
+#
+# Aturan baru: selama masih ada posisi OPEN untuk symbol + arah yang sama,
+# sinyal berikutnya dengan arah itu TIDAK dicatat sebagai trade baru. Ini
+# meniru perilaku trader nyata -- satu ide, satu posisi, sampai selesai.
+#
+# Yang SENGAJA tidak diblokir: arah berlawanan (BUY saat SELL masih OPEN)
+# tetap dicatat, karena itu pembalikan bias yang sah, bukan duplikasi. HOLD
+# juga tetap dicatat penuh supaya data kalibrasi tidak hilang.
+#
+# Reversibel: env ALLOW_DUPLICATE_OPEN=1 mengembalikan perilaku lama.
+ALLOW_DUPLICATE_OPEN = _env_flag("ALLOW_DUPLICATE_OPEN", False)
 
 
 def _utc_now() -> datetime:
@@ -556,6 +608,52 @@ def record_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
     )
 
     with _connect() as connection:
+        # Anti-duplikat posisi: satu ide, satu posisi. Dicek di dalam
+        # koneksi yang sama dengan INSERT supaya tidak ada celah balapan
+        # antara scanner dan analisis manual yang berjalan bersamaan.
+        if (
+            signal in {"BUY", "SELL"}
+            and not ALLOW_DUPLICATE_OPEN
+        ):
+            existing = connection.execute(
+                """
+                SELECT id, created_at, entry
+                FROM analyses
+                WHERE symbol = ?
+                  AND signal = ?
+                  AND status = 'OPEN'
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                (symbol, signal),
+            ).fetchone()
+
+            if existing is not None:
+                logger.info(
+                    "Sinyal duplikat dilewati | symbol=%s | signal=%s | "
+                    "posisi_aktif_id=%s | dibuka=%s | entry_lama=%s | "
+                    "entry_baru=%s",
+                    symbol,
+                    signal,
+                    existing["id"],
+                    existing["created_at"],
+                    existing["entry"],
+                    entry,
+                )
+                return {
+                    "id": None,
+                    "fingerprint": None,
+                    "symbol": symbol,
+                    "signal": signal,
+                    "status": "SKIPPED_DUPLICATE",
+                    "outcome": "SKIPPED_DUPLICATE",
+                    "max_tp_hit": 0,
+                    "created_at": now_iso,
+                    "inserted": False,
+                    "skipped_reason": "duplicate_open",
+                    "blocking_id": existing["id"],
+                }
+
         cursor = connection.execute(
             """
             INSERT OR IGNORE INTO analyses (
