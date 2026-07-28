@@ -714,6 +714,7 @@ def record_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
         # memungkinkan /diag menjawab "gate mana yang paling sering
         # menahan sinyal" dengan angka.
         "hold_blockers": analysis.get("hold_blockers") or [],
+        "hold_blocker_primary": analysis.get("hold_blocker_primary"),
         "cache_hit": analysis.get("cache_hit", False),
         "cache_age_seconds": analysis.get(
             "cache_age_seconds",
@@ -1760,6 +1761,7 @@ def get_hold_blocker_census(days: int = 30) -> dict[str, Any]:
     start_time = _report_start_time(safe_days)
 
     counts: dict[str, int] = {}
+    primary_counts: dict[str, int] = {}
     holds_with_data = 0
     holds_without_data = 0
     near_miss = 0
@@ -1795,6 +1797,11 @@ def get_hold_blocker_census(days: int = 30) -> dict[str, Any]:
             key = str(blocker)
             counts[key] = counts.get(key, 0) + 1
 
+        # Pemblokir utama: gate pertama yang gagal. Trade lama tidak punya
+        # field ini, jadi diturunkan dari urutan daftar sebagai cadangan.
+        primary = metadata.get("hold_blocker_primary") or blockers[0]
+        primary_counts[str(primary)] = primary_counts.get(str(primary), 0) + 1
+
     ranked = sorted(counts.items(), key=lambda item: item[1], reverse=True)
 
     return {
@@ -1805,6 +1812,14 @@ def get_hold_blocker_census(days: int = 30) -> dict[str, Any]:
         "near_miss_single_gate": near_miss,
         "blockers": [
             {"gate": gate, "count": count} for gate, count in ranked
+        ],
+        "primary_blockers": [
+            {"gate": gate, "count": count}
+            for gate, count in sorted(
+                primary_counts.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )
         ],
     }
 
