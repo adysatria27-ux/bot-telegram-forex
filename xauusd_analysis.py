@@ -80,6 +80,26 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
+def _early_env_float(name: str, default: float) -> float:
+    """
+    Versi ringkas pembaca env float yang tersedia SEBELUM blok konstanta.
+
+    _env_float() yang lengkap didefinisikan setelah blok konstanta (urutan
+    historis file ini). Beberapa konstanta geometri perlu bisa disetel lewat
+    environment variable tanpa dipindah-pindah posisinya, jadi helper kecil
+    ini dipakai lebih dulu. Perilakunya identik: env kosong/tidak valid ->
+    pakai default.
+    """
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Env %s bukan angka valid: %s", name, raw)
+        return default
+
+
 # =============================================================================
 # 1. KONFIGURASI DATA DAN TIMEFRAME
 # =============================================================================
@@ -366,19 +386,111 @@ ENTRY_TIMEFRAME_FOR_ATR = "15min"
 
 ATR_SL_MULTIPLIER = 1.5
 
-# PENTING: TP tidak lagi memakai kelipatan ATR yang independen dari SL.
-# Sebelumnya TP1=1.5x dan TP2=2.5x ATR menghasilkan RR tetap 1:1.0 dan 1:1.67,
-# yang secara matematis TIDAK PERNAH bisa mencapai minimum 1:2 berapa pun
-# kuatnya confidence. Sekarang TP diturunkan langsung dari jarak SL dikali
-# target RR, sehingga RR minimum terjamin by design, bukan kebetulan.
-RR_TARGET_TP1 = 2.0
-RR_TARGET_TP2 = 3.0
-RR_TARGET_TP3 = 4.0
+# TP diturunkan langsung dari jarak SL dikali target RR, sehingga rasio RR
+# terjamin by design, bukan kebetulan hasil kelipatan ATR yang independen.
+#
+# === GEOMETRI SCALPING (2026-07-29) ======================================
+# Sebelumnya TP1/2/3 = 2R/3R/4R. Dengan SL 1.5xATR(15m), TP1 lama berarti
+# 3.0 ATR dan TP3 lama berarti 6.0 ATR -- itu target swing, bukan scalping,
+# padahal keputusan diambil dari M5-H1.
+#
+# Bukti dari 40 trade (28-29 Jul), seberapa jauh harga BENAR-BENAR bergerak
+# ke arah sinyal sebelum berbalik:
+#     mencapai 1R : 17 dari 40  (42.5%)
+#     mencapai 2R :  6 dari 40  (15.0%)   <- TP1 lama ada di sini
+#     mencapai 3R :  2 dari 40  ( 5.0%)
+#     mencapai 4R :  2 dari 40  ( 5.0%)   <- TP3 lama ada di sini
+#
+# Arah bot benar sampai 1R pada 42.5% trade. Yang salah bukan arahnya,
+# melainkan target yang terlalu jauh untuk horizon scalping: 17 trade
+# bergerak untung, hanya 2 yang dibayar. Tangga dipindah ke 1R/2R/3R
+# supaya level pertama berada di zona yang memang dicapai pasar.
+RR_TARGET_TP1 = _early_env_float("RR_TARGET_TP1", 1.0)
+RR_TARGET_TP2 = _early_env_float("RR_TARGET_TP2", 2.0)
+RR_TARGET_TP3 = _early_env_float("RR_TARGET_TP3", 3.0)
 
-# Risk Reward minimum yang wajib dipenuhi TP1 agar sinyal boleh keluar.
-# Ditegakkan juga sebagai hard-gate di _build_market_analysis, bukan cuma
-# konsekuensi tidak langsung dari multiplier di atas.
+# --- Aturan Risk Reward 1:2 (item 8 instruksi) ---------------------------
+# Aturan itu TIDAK dihapus, tapi dipindah ke tempat yang benar. Sebelumnya
+# ditegakkan pada TP1; untuk scalping itu justru mengunci target pertama di
+# zona yang jarang tercapai (15%).
+#
+# Sekarang:
+#   - MIN_RR_TP1 (1.0) menjaga TP1 tidak pernah lebih dekat dari risikonya,
+#     jadi tidak ada trade dengan reward lebih kecil dari risk.
+#   - MIN_RISK_REWARD_RATIO (2.0) tetap 1:2 dan sekarang ditegakkan pada
+#     TARGET AKHIR (TP3). Runner-nya tetap wajib menawarkan minimal 1:2.
+#   - Rata-rata tertimbang tangga penuh (bobot 50/25/25 di PARTIAL_TP_WEIGHTS)
+#     = 0.5x1R + 0.25x2R + 0.25x3R = 1.75R terhadap risiko 1R. Angka ini
+#     sengaja ditulis apa adanya: lebih rendah dari 2.0, dan itu memang
+#     konsekuensi jujur dari memindah target pertama lebih dekat. Yang
+#     ditukar: rasio per-trade sedikit turun, frekuensi realisasi naik dari
+#     15% ke 42.5%. Untuk scalping, pertukaran itu yang benar.
+MIN_RR_TP1 = 1.0
 MIN_RISK_REWARD_RATIO = 2.0
+
+# --- Partial close ------------------------------------------------------
+# Porsi posisi yang ditutup di TP1 / TP2 / TP3. Sisa setelah TP1 dilindungi
+# breakeven (mesin breakeven di signal_tracker.py sudah ada sejak P1, tidak
+# diubah). Bobot ini dipakai untuk menghitung realized R yang jujur:
+# sebelumnya tracker hanya mengenal "TP3 penuh atau tidak sama sekali",
+# sehingga 15 dari 17 trade yang sudah untung tercatat 0R.
+#
+# Default 50/25/25: separuh diamankan di level yang paling sering tercapai,
+# sisanya dibiarkan berjalan supaya trade yang benar-benar tren tetap
+# menghasilkan lebih dari 1R.
+PARTIAL_TP_WEIGHTS = (
+    max(0.0, _early_env_float("PARTIAL_TP1_WEIGHT", 0.50)),
+    max(0.0, _early_env_float("PARTIAL_TP2_WEIGHT", 0.25)),
+    max(0.0, _early_env_float("PARTIAL_TP3_WEIGHT", 0.25)),
+)
+
+
+def _normalized_partial_weights() -> tuple[float, float, float]:
+    """
+    Bobot partial close yang dijamin berjumlah 1.0.
+
+    Kalau env diisi tidak wajar (jumlah 0 atau negatif semua), jatuh ke
+    perilaku lama: seluruh posisi ditutup di TP3.
+    """
+    total = sum(PARTIAL_TP_WEIGHTS)
+    if total <= 0:
+        return (0.0, 0.0, 1.0)
+    return (
+        PARTIAL_TP_WEIGHTS[0] / total,
+        PARTIAL_TP_WEIGHTS[1] / total,
+        PARTIAL_TP_WEIGHTS[2] / total,
+    )
+
+
+def _clamp_rr_ladder(
+    rr_tp1: float,
+    rr_tp2: float,
+    rr_tp3: float,
+) -> tuple[float, float, float]:
+    """
+    Menjaga tangga RR tetap sah berapa pun isian env/AssetConfig.
+
+    Aturan yang ditegakkan:
+      1. TP1 minimal 1R (MIN_RR_TP1) -- reward tidak boleh lebih kecil
+         dari risiko.
+      2. Tangga harus menaik: TP2 >= TP1, TP3 >= TP2.
+      3. Target akhir minimal 1:2 (MIN_RISK_REWARD_RATIO) -- inilah tempat
+         aturan item 8 ditegakkan sekarang.
+
+    Sebelumnya logika ini disalin di dua tempat (resolver aset dan
+    _build_market_analysis). Disatukan supaya tidak bisa lagi berbeda
+    diam-diam di antara keduanya.
+    """
+    if rr_tp1 < MIN_RR_TP1:
+        rr_tp1 = MIN_RR_TP1
+    if rr_tp2 < rr_tp1:
+        rr_tp2 = rr_tp1
+    if rr_tp3 < rr_tp2:
+        rr_tp3 = rr_tp2
+    if rr_tp3 < MIN_RISK_REWARD_RATIO:
+        rr_tp3 = MIN_RISK_REWARD_RATIO
+
+    return rr_tp1, rr_tp2, rr_tp3
 
 
 def _resolve_risk_geometry(
@@ -391,9 +503,10 @@ def _resolve_risk_geometry(
     default -> jatuh ke konstanta global di atas, artinya aset yang belum
     diberi override berperilaku PERSIS seperti sebelum field ini ada.
 
-    Guard: rr_tp1 tidak pernah boleh di bawah MIN_RISK_REWARD_RATIO walau
-    override aset salah diisi -- aturan RR minimum 1:2 (item 8 instruksi)
-    tidak boleh bocor lewat konfigurasi per-aset.
+    Guard (disesuaikan dengan geometri scalping): TP1 tidak boleh lebih
+    dekat dari 1R (MIN_RR_TP1) dan target akhir TP3 tidak boleh di bawah
+    1:2 (MIN_RISK_REWARD_RATIO). Aturan RR minimum item 8 tetap tidak bisa
+    bocor lewat konfigurasi per-aset, hanya pindah ke target akhir.
     """
     atr_sl_multiplier = (
         asset.atr_sl_multiplier
@@ -404,12 +517,7 @@ def _resolve_risk_geometry(
     rr_tp2 = asset.rr_tp2 if asset.rr_tp2 is not None else RR_TARGET_TP2
     rr_tp3 = asset.rr_tp3 if asset.rr_tp3 is not None else RR_TARGET_TP3
 
-    if rr_tp1 < MIN_RISK_REWARD_RATIO:
-        rr_tp1 = MIN_RISK_REWARD_RATIO
-    if rr_tp2 < rr_tp1:
-        rr_tp2 = rr_tp1
-    if rr_tp3 < rr_tp2:
-        rr_tp3 = rr_tp2
+    rr_tp1, rr_tp2, rr_tp3 = _clamp_rr_ladder(rr_tp1, rr_tp2, rr_tp3)
 
     return atr_sl_multiplier, rr_tp1, rr_tp2, rr_tp3
 
@@ -445,7 +553,22 @@ MIN_DIRECTIONAL_AGREEMENT = 0.65
 #
 # Dibuat env-driven supaya kalibrasi berikutnya tidak perlu ubah kode:
 # set MIN_CONFIDENCE_FOR_SIGNAL=65 (lebih longgar) atau =78 (lebih ketat).
-MIN_CONFIDENCE_FOR_SIGNAL = 72.0
+#
+# === DITURUNKAN 2026-07-29: 72.0 -> 66.0 ==================================
+# Kenaikan ke 72 pada 28 Jul dikalibrasi terhadap pertanyaan "bucket mana
+# yang paling sering MENYENTUH TP1", dan TP1 waktu itu berada di 2R. Dengan
+# tangga scalping yang baru, TP1 pindah ke 1R -- kalibrasi lama otomatis
+# tidak berlaku lagi, karena pertanyaannya sekarang "bucket mana yang paling
+# sering mencapai 1R", dan 1R dicapai 42.5% trade (bukan 15%).
+#
+# Ambang 72 dipertahankan akan membuang sinyal yang, dengan target baru,
+# sebenarnya punya peluang realisasi wajar. 66 dipilih supaya bucket 60-69
+# yang jelas terburuk tetap sebagian besar tersaring, tanpa ikut membuang
+# bagian atas bucket itu yang berbatasan dengan 70-79.
+#
+# Ini MENAMBAH jumlah sinyal, dan itu memang disengaja: dengan realisasi
+# partial di 1R, sinyal marginal tidak lagi otomatis berakhir 0R atau -1R.
+MIN_CONFIDENCE_FOR_SIGNAL = 66.0
 
 # Konfigurasi price action dan market structure.
 SWING_WINDOW = 2
@@ -3092,13 +3215,13 @@ def _build_indicator_checklist(
     )
 
     if risk_reward_tp1 is not None:
-        if risk_reward_tp1 >= MIN_RISK_REWARD_RATIO:
+        if risk_reward_tp1 >= MIN_RR_TP1:
             add("Risk Reward (TP1)", "PASS", f"1:{risk_reward_tp1:.2f}")
         else:
             add(
                 "Risk Reward (TP1)",
                 "FAIL",
-                f"1:{risk_reward_tp1:.2f} (min 1:{MIN_RISK_REWARD_RATIO:.1f})",
+                f"1:{risk_reward_tp1:.2f} (min 1:{MIN_RR_TP1:.1f})",
             )
     else:
         add("Risk Reward (TP1)", "WARN", "Belum dapat dihitung")
@@ -3123,15 +3246,10 @@ async def _build_market_analysis(
     rr_tp3: float = RR_TARGET_TP3,
 ) -> dict:
     """Mengambil dan menganalisis market secara multi-timeframe."""
-    # Guard RR minimum -- lihat _resolve_risk_geometry(). Diulang di sini
-    # supaya _build_market_analysis tetap aman dipanggil langsung (mis. dari
-    # test) tanpa lewat get_market_data/_resolve_risk_geometry.
-    if rr_tp1 < MIN_RISK_REWARD_RATIO:
-        rr_tp1 = MIN_RISK_REWARD_RATIO
-    if rr_tp2 < rr_tp1:
-        rr_tp2 = rr_tp1
-    if rr_tp3 < rr_tp2:
-        rr_tp3 = rr_tp2
+    # Guard RR -- lihat _clamp_rr_ladder(). Diulang di sini supaya
+    # _build_market_analysis tetap aman dipanggil langsung (mis. dari test)
+    # tanpa lewat get_market_data/_resolve_risk_geometry.
+    rr_tp1, rr_tp2, rr_tp3 = _clamp_rr_ladder(rr_tp1, rr_tp2, rr_tp3)
 
     if not TWELVE_DATA_API_KEY:
         raise RuntimeError(
@@ -3344,10 +3462,16 @@ async def _build_market_analysis(
         prospective_tp3,
     )
 
+    # Aturan RR (item 8) sekarang dua lapis, sesuai geometri scalping:
+    # TP1 minimal 1R supaya reward tidak pernah lebih kecil dari risiko, dan
+    # target akhir TP3 minimal 1:2 supaya aturan asli tetap dipenuhi trade
+    # secara keseluruhan.
     enough_risk_reward = (
         candidate_signal in {"BUY", "SELL"}
         and risk_reward_tp1 is not None
-        and risk_reward_tp1 >= MIN_RISK_REWARD_RATIO
+        and risk_reward_tp3 is not None
+        and risk_reward_tp1 >= MIN_RR_TP1
+        and risk_reward_tp3 >= MIN_RISK_REWARD_RATIO
     )
 
     enough_timeframes = len(timeframe_results) >= MIN_TIMEFRAMES_FOR_SIGNAL
@@ -3380,22 +3504,89 @@ async def _build_market_analysis(
     # Hard-gate yang tersisa hanya untuk hal yang benar-benar tidak layak
     # ditawar: kualitas data, konfluensi minimum, dan Risk Reward.
     # ------------------------------------------------------------------
-    if (
-        candidate_signal in {"BUY", "SELL"}
-        and enough_timeframes
-        and enough_coverage
-        and enough_agreement
-        and enough_confidence
-        and enough_structure
-        and not_too_sideways
-        and false_breakout_filter_passed
-        and enough_risk_reward
-    ):
+    # ------------------------------------------------------------------
+    # PENCATATAN PEMBLOKIR HOLD (2026-07-29)
+    # Sebelumnya keputusan ini berupa satu ekspresi boolean raksasa: kalau
+    # hasilnya HOLD, tidak ada satu pun catatan gate MANA yang menggugurkan.
+    # Akibatnya keluhan "confidence 75-85% tapi tetap HOLD" tidak pernah
+    # bisa dijawab dengan angka, hanya dengan tebakan.
+    #
+    # Sekarang tiap gate dievaluasi ke dalam daftar terurut. Kode gate ini
+    # ikut disimpan ke DB (metadata) dan diagregasi di /diag, sehingga
+    # pelonggaran berikutnya bisa menyasar gate yang MEMANG paling sering
+    # memblokir -- bukan menurunkan semua ambang sambil menebak.
+    # ------------------------------------------------------------------
+    gate_checks: tuple[tuple[str, bool, str], ...] = (
+        (
+            "arah",
+            candidate_signal in {"BUY", "SELL"},
+            f"Skor gabungan {combined_score:+.2f} belum mencapai ambang "
+            f"±{SIGNAL_SCORE_THRESHOLD:.2f}",
+        ),
+        (
+            "jumlah_timeframe",
+            enough_timeframes,
+            f"Timeframe tersedia {len(timeframe_results)} < minimum "
+            f"{MIN_TIMEFRAMES_FOR_SIGNAL}",
+        ),
+        (
+            "coverage_data",
+            enough_coverage,
+            f"Kelengkapan data {coverage_ratio * 100:.0f}% < "
+            f"{MIN_COVERAGE_RATIO * 100:.0f}%",
+        ),
+        (
+            "keselarasan_timeframe",
+            enough_agreement,
+            f"Keselarasan timeframe {directional_agreement * 100:.0f}% < "
+            f"{MIN_DIRECTIONAL_AGREEMENT * 100:.0f}%",
+        ),
+        (
+            "confidence",
+            enough_confidence,
+            f"Confidence {confidence_pct:.1f}% < "
+            f"{MIN_CONFIDENCE_FOR_SIGNAL:.0f}%",
+        ),
+        (
+            "market_structure",
+            enough_structure,
+            f"Konfirmasi struktur {structure_confirmation * 100:.0f}% < "
+            f"{MIN_STRUCTURE_CONFIRMATION * 100:.0f}% dan skor gabungan "
+            "belum cukup kuat untuk menggantikannya",
+        ),
+        (
+            "sideways",
+            not_too_sideways,
+            f"Pasar sideways {sideways_ratio * 100:.0f}% > "
+            f"{MAX_SIDEWAYS_RATIO_FOR_SIGNAL * 100:.0f}%",
+        ),
+        (
+            "false_breakout",
+            false_breakout_filter_passed,
+            f"False breakout melawan arah "
+            f"{false_breakout_against_ratio * 100:.0f}% > "
+            f"{MAX_FALSE_BREAKOUT_AGAINST_RATIO * 100:.0f}%",
+        ),
+        (
+            "risk_reward",
+            enough_risk_reward,
+            "Tangga Risk Reward tidak memenuhi syarat minimum",
+        ),
+    )
+
+    hold_blockers = [code for code, passed, _ in gate_checks if not passed]
+    hold_blocker_details = [
+        detail for _, passed, detail in gate_checks if not passed
+    ]
+
+    if not hold_blockers:
         signal = candidate_signal
     else:
         signal = "HOLD"
 
     direction = "NEUTRAL" if signal == "HOLD" else signal
+
+    partial_w1, partial_w2, partial_w3 = _normalized_partial_weights()
 
     stop_loss = prospective_sl if signal in {"BUY", "SELL"} else None
     take_profit_1 = prospective_tp1 if signal in {"BUY", "SELL"} else None
@@ -3452,6 +3643,15 @@ async def _build_market_analysis(
         overextension_ratio=overextension_ratio,
         risk_reward_ok=enough_risk_reward,
     )
+
+    # Transparansi HOLD (2026-07-29): sebutkan gate pemblokir di paling atas
+    # daftar alasan. Ini yang menjawab langsung "kenapa HOLD lagi" tanpa
+    # pemilik bot harus membaca seluruh checklist.
+    if signal == "HOLD" and hold_blocker_details:
+        reasons.insert(
+            0,
+            "Diblokir oleh: " + "; ".join(hold_blocker_details[:3]) + ".",
+        )
 
     # Transparansi (item 12): kalau geometri SL/TP instrumen ini berbeda
     # dari default global, jelaskan di alasan supaya tidak membingungkan
@@ -3545,6 +3745,19 @@ async def _build_market_analysis(
         "trend_alignment_score": round(trend_alignment_score, 2),
         "counter_trend_penalty": round(counter_trend_penalty, 2),
         "min_risk_reward_ratio": MIN_RISK_REWARD_RATIO,
+        "min_risk_reward_tp1": MIN_RR_TP1,
+        "hold_blockers": hold_blockers,
+        "hold_blocker_details": hold_blocker_details,
+        "partial_plan": (
+            [
+                {"level": "TP1", "price": take_profit_1, "weight": partial_w1},
+                {"level": "TP2", "price": take_profit_2, "weight": partial_w2},
+                {"level": "TP3", "price": take_profit_3, "weight": partial_w3},
+            ]
+            if signal in {"BUY", "SELL"}
+            else []
+        ),
+        "rr_ladder": {"tp1": rr_tp1, "tp2": rr_tp2, "tp3": rr_tp3},
         "atr_sl_multiplier_used": atr_sl_multiplier,
         "risk_reward_ok": enough_risk_reward,
         "near_psychological_level": near_psychological_level,
@@ -3819,18 +4032,42 @@ def generate_signal_message(analysis: dict) -> str:
         rr1 = analysis.get("risk_reward_tp1")
         rr2 = analysis.get("risk_reward_tp2")
 
+        rr3 = analysis.get("risk_reward_tp3")
+        # Rencana partial ditampilkan eksplisit supaya pemilik bot tahu
+        # PERSIS berapa persen yang harus ditutup di tiap level. Tanpa ini,
+        # geometri baru (TP1 di 1R) akan terbaca seperti target yang
+        # mengecil, padahal maksudnya membukukan lebih awal lalu membiarkan
+        # sisanya berjalan.
+        weight_1, weight_2, weight_3 = _normalized_partial_weights()
+
         lines.extend(
             [
                 f"*Entry:* {entry:.{decimals}f}",
                 f"*SL:* {stop_loss:.{decimals}f}",
-                f"*TP1:* {tp1:.{decimals}f}",
-                f"*TP2:* {tp2:.{decimals}f}",
-                f"*TP3:* {tp3:.{decimals}f}",
                 (
-                    f"*Risk Reward:* TP1 1:{rr1:.2f} | TP2 1:{rr2:.2f}"
-                    if rr1 is not None and rr2 is not None
+                    f"*TP1:* {tp1:.{decimals}f}  "
+                    f"(tutup {weight_1 * 100:.0f}%"
+                    + (f", 1:{rr1:.1f}" if rr1 is not None else "")
+                    + ")"
+                ),
+                (
+                    f"*TP2:* {tp2:.{decimals}f}  "
+                    f"(tutup {weight_2 * 100:.0f}%"
+                    + (f", 1:{rr2:.1f}" if rr2 is not None else "")
+                    + ")"
+                ),
+                (
+                    f"*TP3:* {tp3:.{decimals}f}  "
+                    f"(sisa {weight_3 * 100:.0f}%"
+                    + (f", 1:{rr3:.1f}" if rr3 is not None else "")
+                    + ")"
+                ),
+                (
+                    f"*Risk Reward:* TP1 1:{rr1:.2f} | TP3 1:{rr3:.2f}"
+                    if rr1 is not None and rr3 is not None
                     else "*Risk Reward:* belum tersedia"
                 ),
+                "_Setelah TP1 tersentuh, SL dipindah ke entry (breakeven)._",
             ]
         )
     else:
