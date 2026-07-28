@@ -3579,6 +3579,15 @@ async def _build_market_analysis(
         detail for _, passed, detail in gate_checks if not passed
     ]
 
+    # Pemblokir UTAMA = gate pertama yang gagal, dalam urutan sebab-akibat.
+    # Ini penting dan tidak sekadar kosmetik: kalau `arah` gagal, maka
+    # directional_agreement/structure/pattern/trend_alignment semuanya
+    # dipaksa 0, sehingga `confidence` PASTI ikut gagal sebagai akibat --
+    # bukan sebagai sebab. Tanpa pemisahan ini, sensus HOLD akan selalu
+    # menuding confidence sebagai biang keladi dan menggoda kita
+    # menurunkan ambang confidence, padahal akar masalahnya skor arah.
+    hold_blocker_primary = hold_blockers[0] if hold_blockers else None
+
     if not hold_blockers:
         signal = candidate_signal
     else:
@@ -3747,6 +3756,7 @@ async def _build_market_analysis(
         "min_risk_reward_ratio": MIN_RISK_REWARD_RATIO,
         "min_risk_reward_tp1": MIN_RR_TP1,
         "hold_blockers": hold_blockers,
+        "hold_blocker_primary": hold_blocker_primary,
         "hold_blocker_details": hold_blocker_details,
         "partial_plan": (
             [
