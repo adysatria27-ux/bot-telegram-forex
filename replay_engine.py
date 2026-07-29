@@ -143,7 +143,8 @@ def simulate_exit(
     risk = abs(entry - stop_loss)
     if risk <= 0:
         return {"outcome": "INVALID", "max_tp_hit": 0, "exit_price": None,
-                "breakeven": False, "mfe_r": 0.0, "mae_r": 0.0, "bars": 0}
+                "exit_time": None, "breakeven": False, "mfe_r": 0.0,
+                "mae_r": 0.0, "bars": 0}
 
     direction = 1.0 if signal == "BUY" else -1.0
     tp1, tp2, tp3 = targets
@@ -159,6 +160,7 @@ def simulate_exit(
                 "outcome": f"EXPIRED_TP{max_tp_hit}" if max_tp_hit else "EXPIRED",
                 "max_tp_hit": max_tp_hit,
                 "exit_price": float(candle.close),
+                "exit_time": candle.datetime,
                 "breakeven": False,
                 "mfe_r": mfe / risk,
                 "mae_r": mae / risk,
@@ -190,6 +192,7 @@ def simulate_exit(
                 ),
                 "max_tp_hit": max_tp_hit,
                 "exit_price": entry if breakeven_active else stop_loss,
+                "exit_time": candle.datetime,
                 "breakeven": breakeven_active,
                 "mfe_r": mfe / risk,
                 "mae_r": mae / risk,
@@ -206,6 +209,7 @@ def simulate_exit(
         if max_tp_hit >= 3:
             return {
                 "outcome": "TP3", "max_tp_hit": 3, "exit_price": tp3,
+                "exit_time": candle.datetime,
                 "breakeven": False, "mfe_r": mfe / risk,
                 "mae_r": mae / risk, "bars": bars,
             }
@@ -213,6 +217,7 @@ def simulate_exit(
     return {
         "outcome": "UNRESOLVED", "max_tp_hit": max_tp_hit,
         "exit_price": float(future["close"].iloc[-1]) if len(future) else None,
+        "exit_time": future["datetime"].iloc[-1] if len(future) else None,
         "breakeven": False, "mfe_r": mfe / risk, "mae_r": mae / risk,
         "bars": len(future),
     }
@@ -229,6 +234,7 @@ async def replay_pair(
     step: int,
     max_steps: int | None,
     breakeven_at_mfe_r: float,
+    allow_overlap: bool = False,
 ) -> dict:
     frames = load_frames(pair, timeframes)
     missing = [tf for tf in timeframes if tf not in frames]
@@ -289,6 +295,11 @@ async def replay_pair(
     primary_blockers: dict[str, int] = {}
     evaluated = 0
     errors = 0
+    skipped_busy = 0
+
+    # Posisi terbuka terakhir. Selama trade belum keluar, evaluasi
+    # berikutnya dilewati -- lihat catatan "SATU POSISI PER PAIR".
+    busy_until = None
 
     indices = range(0, len(usable) - 1, max(1, step))
     if max_steps:
@@ -297,6 +308,21 @@ async def replay_pair(
     try:
         for position in indices:
             state["cutoff"] = usable["datetime"].iloc[position]
+
+            # SATU POSISI PER PAIR (default).
+            # Tanpa aturan ini, satu setup yang bertahan 11 candle akan
+            # dicatat sebagai 11 trade berisi gerakan pasar YANG SAMA:
+            # Total R membesar sebanding 1/step dan sampel terlihat jauh
+            # lebih besar daripada jumlah kejadian independen yang
+            # sebenarnya. Produksi juga tidak begitu -- ada cooldown alert
+            # dan fingerprint dedup di signal_tracker.
+            if (
+                not allow_overlap
+                and busy_until is not None
+                and state["cutoff"] <= busy_until
+            ):
+                skipped_busy += 1
+                continue
 
             # Cache 30 detik milik produksi harus dibersihkan tiap langkah,
             # kalau tidak seluruh replay hanya menganalisis satu titik waktu.
@@ -384,7 +410,11 @@ async def replay_pair(
                 "spread_cost_r": spread_cost_r,
                 "net_r": net_r,
                 "overextension": analysis.get("overextension_ratio_pct"),
+                "exit_time": result.get("exit_time"),
             })
+
+            if not allow_overlap:
+                busy_until = result.get("exit_time")
     finally:
         xa._fetch_ohlc = original_fetch
         xa._resolve_provider_symbol = original_resolve
@@ -396,6 +426,8 @@ async def replay_pair(
         "thin_timeframes": thin_timeframes,
         "evaluated": evaluated,
         "errors": errors,
+        "skipped_busy": skipped_busy,
+        "allow_overlap": allow_overlap,
         "holds": holds,
         "blockers": blockers,
         "primary_blockers": primary_blockers,
@@ -426,6 +458,13 @@ def report(result: dict) -> None:
               "jendela uji dipersempit oleh timeframe ini")
     print(f"Titik evaluasi : {result['evaluated']}"
           + (f"  (gagal: {result['errors']})" if result["errors"] else ""))
+    if result.get("allow_overlap"):
+        print("Mode posisi    : TUMPANG TINDIH (angka R menggandakan "
+              "gerakan yang sama -- hanya untuk perbandingan)")
+    else:
+        print(f"Mode posisi    : satu posisi per pair "
+              f"({result.get('skipped_busy', 0)} evaluasi dilewati "
+              "karena posisi masih terbuka)")
     print(f"HOLD           : {result['holds']} "
           f"({result['holds'] / max(result['evaluated'], 1) * 100:.1f}%)")
     print(f"Sinyal         : {len(trades)}")
@@ -548,6 +587,7 @@ async def run(args) -> int:
             step=args.step,
             max_steps=args.max_steps,
             breakeven_at_mfe_r=args.breakeven_mfe_r,
+            allow_overlap=args.allow_overlap,
         )
         report(result)
         if "error" not in result and result["trades"]:
@@ -580,6 +620,12 @@ def main() -> int:
     parser.add_argument("--breakeven-mfe-r", type=float, default=0.0,
                         help="Breakeven dini pada n x R (0 = mati).")
     parser.add_argument("--spread-xau", type=float, default=None)
+    parser.add_argument(
+        "--allow-overlap",
+        action="store_true",
+        help="Izinkan trade tumpang tindih (perilaku lama, "
+             "menggandakan hasil -- hanya untuk pembanding).",
+    )
     args = parser.parse_args()
 
     if not DATA_DIR.exists():
