@@ -47,6 +47,26 @@ FALLBACK_DATABASE = Path("signal_tracker.db").resolve()
 
 DEFAULT_SIGNAL_EXPIRY_HOURS = 12
 CRYPTO_SIGNAL_EXPIRY_HOURS = 24
+
+# Masa berlaku sinyal dihitung dalam JUMLAH CANDLE, bukan jam tetap.
+#
+# Sebelumnya 12 jam dipakai untuk semua timeframe. Angka itu dirancang saat
+# eksekusi di M15 (12 jam = 48 candle, wajar). Tapi konstanta yang sama ikut
+# terbawa ke timeframe lain tanpa penyesuaian, dan di situ jadi merusak:
+# di eksekusi H4, 12 jam hanya memberi TIGA candle kepada tiap trade.
+# Backtest 185 sinyal EUR/USD menunjukkan 74% trade mati kedaluwarsa
+# (102 EXPIRED + 28 EXPIRED_TP1 + 7 EXPIRED_TP2) dan TP3 tercapai cuma
+# 1 kali -- bukan karena targetnya keliru, tapi karena tidak pernah ada
+# waktu untuk mencapainya.
+#
+# Dengan basis candle, masa berlaku ikut menyesuaikan skala waktu secara
+# otomatis. Nilai default sengaja dipilih agar PERSIS mereproduksi
+# perilaku lama pada M15: 48 x 15 menit = 12 jam, dan crypto
+# 96 x 15 menit = 24 jam. Jadi produksi tidak berubah sedikit pun sampai
+# timeframe eksekusinya memang diubah.
+SIGNAL_EXPIRY_CANDLES = 48
+CRYPTO_SIGNAL_EXPIRY_CANDLES = 96
+_REFERENCE_TIMEFRAME_FALLBACK = "15min"
 MAX_RECENT_SIGNAL_LIMIT = 50
 
 _SCHEMA_VERSION = 1
@@ -592,11 +612,54 @@ def _fingerprint_analysis(analysis: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _signal_expiry_hours(asset_class: str) -> int:
-    """Menentukan masa berlaku sinyal berdasarkan kelas aset."""
-    if asset_class.lower() == "crypto":
-        return CRYPTO_SIGNAL_EXPIRY_HOURS
+def _timeframe_minutes(timeframe: Any) -> int:
+    """
+    Mengubah label timeframe ("15min", "1h", "4h") menjadi menit.
 
+    Nilai tak dikenal dikembalikan sebagai 15 menit -- sama dengan
+    perilaku lama -- supaya data lama atau field kosong tidak pernah
+    membuat sinyal gagal tercatat.
+    """
+    text = str(timeframe or "").strip().lower()
+    try:
+        if text.endswith("min"):
+            return max(1, int(text[:-3]))
+        if text.endswith("h"):
+            return max(1, int(text[:-1]) * 60)
+        if text.endswith("day") or text.endswith("d"):
+            return max(1, int(text.rstrip("day").rstrip("d") or 1) * 1440)
+    except ValueError:
+        pass
+    return 15
+
+
+def _env_int(name: str, default: int) -> int:
+    """Membaca environment variable integer secara toleran."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning("%s tidak valid: %s", name, raw)
+        return default
+
+
+def _signal_expiry_hours(
+    asset_class: str,
+    reference_timeframe: Any = None,
+) -> int:
+    """
+    Masa berlaku sinyal, diskalakan terhadap timeframe eksekusi.
+
+    Urutan prioritas:
+      1. SIGNAL_MAX_AGE_HOURS -- override absolut dalam jam (perilaku lama,
+         tetap dihormati supaya setelan yang sudah terpasang tidak berubah).
+      2. Jumlah candle x panjang timeframe referensi.
+
+    Pada M15 hasilnya identik dengan konstanta lama (12 jam / 24 jam crypto),
+    jadi mengganti file ini TIDAK mengubah perilaku produksi saat ini.
+    """
     configured = os.getenv("SIGNAL_MAX_AGE_HOURS", "").strip()
     if configured:
         try:
@@ -607,7 +670,15 @@ def _signal_expiry_hours(asset_class: str) -> int:
                 configured,
             )
 
-    return DEFAULT_SIGNAL_EXPIRY_HOURS
+    is_crypto = str(asset_class).lower() == "crypto"
+    candles = _env_int(
+        "SIGNAL_EXPIRY_CANDLES",
+        CRYPTO_SIGNAL_EXPIRY_CANDLES if is_crypto else SIGNAL_EXPIRY_CANDLES,
+    )
+    minutes = _timeframe_minutes(
+        reference_timeframe or _REFERENCE_TIMEFRAME_FALLBACK
+    )
+    return max(1, round(candles * minutes / 60))
 
 
 def record_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
@@ -669,7 +740,10 @@ def record_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
         status = "OPEN"
         outcome = "PENDING"
         expires_at = created_at + timedelta(
-            hours=_signal_expiry_hours(asset_class)
+            hours=_signal_expiry_hours(
+                asset_class,
+                analysis.get("atr_reference_tf"),
+            )
         )
     else:
         status = "NO_TRADE"
