@@ -48,7 +48,7 @@ import pandas as pd
 os.environ.setdefault("TWELVE_DATA_API_KEY", "REPLAY_OFFLINE")
 
 import xauusd_analysis as xa  # noqa: E402
-from signal_tracker import _realized_r  # noqa: E402
+from signal_tracker import _realized_r, _signal_expiry_hours  # noqa: E402
 
 DATA_DIR = Path("data")
 
@@ -67,8 +67,11 @@ DEFAULT_SPREADS: dict[str, float] = {
     "US30": 3.0,
 }
 
-# Batas waktu hidup sinyal, meniru signal_tracker.
-EXPIRY_HOURS = {"crypto": 24, "default": 12}
+# Batas waktu hidup sinyal diambil LANGSUNG dari signal_tracker
+# (_signal_expiry_hours), bukan disalin. Sebelumnya nilainya di-hardcode di
+# sini, sehingga perubahan aturan expiry di produksi tidak akan pernah
+# tercermin di backtest -- persis jenis penyimpangan diam-diam yang harus
+# dihindari replay engine.
 
 
 # =============================================================================
@@ -223,6 +226,114 @@ def simulate_exit(
     }
 
 
+def _forward_returns(
+    horizons: tuple[int, ...],
+    usable: pd.DataFrame,
+    position: int,
+    entry: float,
+    risk: float,
+    direction: float,
+) -> dict:
+    """
+    Pergerakan harga N candle setelah entry, dalam satuan R.
+
+    SENGAJA mengabaikan SL, TP, breakeven, dan expiry. Tujuannya memisahkan
+    dua pertanyaan yang selama ini tercampur:
+
+        (a) Apakah ARAH sinyal memprediksi pergerakan harga?
+        (b) Apakah GEOMETRI keluar (SL/TP/BE) mengubah prediksi itu
+            menjadi uang?
+
+    Semua pengujian sebelumnya hanya mengukur (a) DAN (b) sekaligus, jadi
+    kegagalan tidak bisa dilacak ke sumbernya. Kalau (a) nol, tidak ada
+    setelan exit apa pun yang bisa menolong -- dan menyetel exit hanya
+    membuang waktu.
+    """
+    out: dict[str, float] = {}
+    closes = usable["close"]
+    for horizon in horizons:
+        target = position + horizon
+        if target >= len(closes):
+            continue
+        move = float(closes.iloc[target]) - entry
+        out[f"h{horizon}"] = direction * move / risk
+    return out
+
+
+def _baseline_drift(usable: pd.DataFrame, horizons: tuple[int, ...]) -> dict:
+    """
+    Pembanding: pergerakan harga tanpa syarat apa pun (semua candle).
+
+    Tanpa ini, hasil positif bisa saja cuma memantulkan tren pasar pada
+    periode itu, bukan kepintaran sinyalnya. Dinyatakan dalam persen agar
+    tidak bergantung pada ukuran risiko tiap trade.
+    """
+    out: dict[str, float] = {}
+    closes = usable["close"].to_numpy()
+    for horizon in horizons:
+        if horizon >= len(closes):
+            continue
+        moves = (closes[horizon:] - closes[:-horizon]) / closes[:-horizon]
+        out[f"h{horizon}"] = float(moves.mean() * 100.0)
+    return out
+
+
+def _sweep_variants(
+    sweep_values: tuple[float, ...],
+    signal: str,
+    entry: float,
+    stop_loss: float,
+    targets: tuple[float, float, float],
+    future: pd.DataFrame,
+    expiry_hours: int,
+    rr_ladder: tuple,
+    weights: tuple,
+    risk: float,
+    spread: float,
+) -> dict:
+    """
+    Menghitung hasil beberapa ambang BREAKEVEN_AT_MFE_R pada trade yang SAMA.
+
+    Ambang breakeven hanya mengubah CARA KELUAR, bukan sinyalnya. Jadi
+    seluruh varian bisa dihitung dalam satu kali jalan -- bagian mahal
+    (get_market_data) tidak perlu diulang. Karena entry-nya identik,
+    perbandingan antar-varian bersifat berpasangan: selisihnya murni
+    berasal dari manajemen trade, bukan dari sampel yang berbeda.
+
+    Batasnya: di dunia nyata breakeven membuat trade keluar lebih cepat,
+    sehingga slot untuk trade berikutnya terbuka lebih awal. Efek itu TIDAK
+    ditangkap di sini. Karena itu pemenang sweep wajib diverifikasi ulang
+    lewat satu run penuh dengan --breakeven-mfe-r nilai tersebut.
+    """
+    variants: dict[str, float] = {}
+    for value in sweep_values:
+        outcome = simulate_exit(
+            signal=signal,
+            entry=entry,
+            stop_loss=stop_loss,
+            targets=targets,
+            future=future,
+            expiry_hours=expiry_hours,
+            breakeven_at_mfe_r=value,
+        )
+        if outcome["outcome"] in {"INVALID", "UNRESOLVED"}:
+            continue
+        gross = _realized_r(
+            signal=signal,
+            entry=entry,
+            risk=risk,
+            rr_ladder=rr_ladder,
+            weights=weights,
+            max_tp_hit=outcome["max_tp_hit"],
+            exit_price=outcome["exit_price"],
+            breakeven=outcome["breakeven"],
+        )
+        if gross is None:
+            continue
+        variants[f"be_{value:g}"] = gross - (spread / risk)
+    return variants
+
+
 # =============================================================================
 # 3. REPLAY SATU PAIR
 # =============================================================================
@@ -230,11 +341,15 @@ async def replay_pair(
     pair: str,
     exec_timeframe: str,
     timeframes: list[str],
+    atr_timeframe: str,
     spread: float,
     step: int,
     max_steps: int | None,
     breakeven_at_mfe_r: float,
     allow_overlap: bool = False,
+    sweep_values: tuple[float, ...] = (),
+    horizons: tuple[int, ...] = (),
+    invert: bool = False,
 ) -> dict:
     frames = load_frames(pair, timeframes)
     missing = [tf for tf in timeframes if tf not in frames]
@@ -280,7 +395,7 @@ async def replay_pair(
 
     exec_frame = frames[exec_timeframe]
     asset = xa.get_asset_config(pair)
-    expiry = EXPIRY_HOURS.get(asset.asset_class, EXPIRY_HOURS["default"])
+    expiry = _signal_expiry_hours(asset.asset_class, atr_timeframe)
     partial_weights = xa._normalized_partial_weights()
 
     # Mulai setelah cukup candle terkumpul untuk seluruh indikator.
@@ -350,6 +465,30 @@ async def replay_pair(
 
             entry = float(analysis["entry"])
             stop_loss = float(analysis["sl"])
+            targets = (
+                float(analysis["tp1"]),
+                float(analysis["tp2"]),
+                float(analysis["tp3"]),
+            )
+
+            if invert:
+                # DIAGNOSTIK: ambil sisi berlawanan dari sinyal.
+                #
+                # Seluruh geometri dicerminkan terhadap harga entry
+                # (x -> 2*entry - x). Ini sah karena SL dan TP dihitung
+                # simetris dari entry: SL = atr_mult x ATR, TP = RR x risk.
+                # Hasilnya jarak risiko dan tangga RR PERSIS sama, cuma
+                # arahnya terbalik -- jadi perbandingannya adil.
+                #
+                # Yang TIDAK ikut terbalik: seluruh gate (arah, sideways,
+                # false_breakout) tetap dirancang untuk logika searah tren.
+                # Karena itu mode ini hanya alat diagnosa, BUKAN strategi
+                # siap pakai. Hasil positif di sini berarti "ada informasi
+                # yang dipakai terbalik", bukan "tinggal dibalik saja".
+                signal = "SELL" if signal == "BUY" else "BUY"
+                stop_loss = (2 * entry) - stop_loss
+                targets = tuple((2 * entry) - level for level in targets)
+
             risk = abs(entry - stop_loss)
             if risk <= 0:
                 continue
@@ -362,11 +501,7 @@ async def replay_pair(
                 signal=signal,
                 entry=entry,
                 stop_loss=stop_loss,
-                targets=(
-                    float(analysis["tp1"]),
-                    float(analysis["tp2"]),
-                    float(analysis["tp3"]),
-                ),
+                targets=targets,
                 future=future,
                 expiry_hours=expiry,
                 breakeven_at_mfe_r=breakeven_at_mfe_r,
@@ -411,6 +546,31 @@ async def replay_pair(
                 "net_r": net_r,
                 "overextension": analysis.get("overextension_ratio_pct"),
                 "exit_time": result.get("exit_time"),
+                **_forward_returns(
+                    horizons=horizons,
+                    usable=usable,
+                    position=position,
+                    entry=entry,
+                    risk=risk,
+                    direction=1.0 if signal == "BUY" else -1.0,
+                ),
+                **_sweep_variants(
+                    sweep_values=sweep_values,
+                    signal=signal,
+                    entry=entry,
+                    stop_loss=stop_loss,
+                    targets=targets,
+                    future=future,
+                    expiry_hours=expiry,
+                    rr_ladder=(
+                        analysis["risk_reward_tp1"],
+                        analysis["risk_reward_tp2"],
+                        analysis["risk_reward_tp3"],
+                    ),
+                    weights=partial_weights,
+                    risk=risk,
+                    spread=spread,
+                ),
             })
 
             if not allow_overlap:
@@ -428,6 +588,10 @@ async def replay_pair(
         "errors": errors,
         "skipped_busy": skipped_busy,
         "allow_overlap": allow_overlap,
+        "sweep_values": sweep_values,
+        "horizons": horizons,
+        "invert": invert,
+        "baseline_drift": _baseline_drift(usable, horizons),
         "holds": holds,
         "blockers": blockers,
         "primary_blockers": primary_blockers,
@@ -469,6 +633,9 @@ def report(result: dict) -> None:
           f"({result['holds'] / max(result['evaluated'], 1) * 100:.1f}%)")
     print(f"Sinyal         : {len(trades)}")
     print(f"Spread dipakai : {result['spread']}")
+    if result.get("invert"):
+        print("Mode arah      : DIBALIK (diagnostik) -- BUY mesin "
+              "dieksekusi SELL, dan sebaliknya")
 
     if not trades:
         print("\nTidak ada sinyal pada periode ini.")
@@ -518,7 +685,62 @@ def report(result: dict) -> None:
           f"MAE rata-rata: {frame['mae_r'].mean():.2f}R  |  "
           f"durasi rata-rata: {frame['bars'].mean():.0f} candle")
 
+    _print_horizons(result, frame)
+    _print_sweep(result, frame)
     _print_blockers(result)
+
+
+def _print_horizons(result: dict, frame: pd.DataFrame) -> None:
+    """Daya prediksi arah, lepas dari mekanika SL/TP."""
+    horizons = result.get("horizons") or ()
+    columns = [(h, f"h{h}") for h in horizons if f"h{h}" in frame.columns]
+    if not columns:
+        return
+
+    drift = result.get("baseline_drift") or {}
+    print("\nUJI DAYA PREDIKSI ARAH (tanpa SL/TP/breakeven):")
+    print(f"  {'Candle':>7} {'n':>5} {'rata2 R':>9} {'t':>7} "
+          f"{'menang':>8} {'drift pasar':>12}")
+    for horizon, column in columns:
+        series = frame[column].dropna()
+        if len(series) < 5:
+            continue
+        mean = series.mean()
+        stderr = series.std(ddof=1) / (len(series) ** 0.5)
+        tstat = mean / stderr if stderr > 0 else 0.0
+        share = (series > 0).mean() * 100
+        print(f"  {horizon:>7} {len(series):>5} {mean:+9.4f} {tstat:+7.2f} "
+              f"{share:>7.1f}% {drift.get(column, 0.0):>+11.4f}%")
+    print("  t di atas +2 = arah sinyal punya daya prediksi nyata.")
+    print("  t sekitar 0  = arah sinyal tidak lebih baik dari tebakan.")
+
+
+def _print_sweep(result: dict, frame: pd.DataFrame) -> None:
+    """Perbandingan berpasangan antar ambang breakeven dini."""
+    values = result.get("sweep_values") or ()
+    columns = [f"be_{value:g}" for value in values]
+    columns = [c for c in columns if c in frame.columns]
+    if not columns:
+        return
+
+    print("\nSWEEP BREAKEVEN DINI (entry identik, hanya cara keluar berbeda):")
+    print(f"  {'BE at':>8} {'Total R':>10} {'R/trade':>10} "
+          f"{'Profit':>9} {'Rugi penuh':>11}")
+    baseline = None
+    for value, column in zip(values, columns):
+        series = frame[column]
+        total = series.sum()
+        if baseline is None:
+            baseline = total
+        wins = int((series > 0.001).sum())
+        full_losses = int((series < -0.9).sum())
+        label = "mati" if value <= 0 else f"{value:g}R"
+        print(f"  {label:>8} {total:+10.2f} {series.mean():+10.4f} "
+              f"{wins:>6}/{len(series):<3} {full_losses:>11}")
+    print("  Catatan: efek 'keluar lebih cepat membuka slot trade baru' "
+          "TIDAK dihitung di sini.")
+    print("  Verifikasi pemenangnya dengan satu run penuh "
+          "--breakeven-mfe-r <nilai>.")
 
 
 def _print_blockers(result: dict) -> None:
@@ -543,6 +765,40 @@ def _print_blockers(result: dict) -> None:
 # =============================================================================
 # 5. CLI
 # =============================================================================
+def _timeframe_minutes(timeframe: str) -> int:
+    """Mengubah label timeframe menjadi menit untuk pengurutan."""
+    text = timeframe.strip().lower()
+    if text.endswith("min"):
+        return int(text[:-3])
+    if text.endswith("h"):
+        return int(text[:-1]) * 60
+    if text.endswith("day") or text.endswith("d"):
+        return int(text.rstrip("day").rstrip("d") or 1) * 1440
+    raise ValueError(f"Timeframe tidak dikenal: {timeframe}")
+
+
+def _timeframe_weights(timeframes: list[str]) -> dict[str, float]:
+    """
+    Bobot per timeframe untuk daftar APA PUN, bukan cuma yang hardcoded.
+
+    Produksi memakai tangga 5min=1.0 s/d 4h=3.0, yaitu +0.5 tiap naik satu
+    anak tangga, dengan timeframe TERBESAR selalu bernilai 3.0. Aturan itu
+    dipertahankan di sini: makin besar timeframe, makin berat, jarak antar
+    tangga tetap 0.5. Untuk 30min/1h/4h hasilnya persis 2.0/2.5/3.0 --
+    identik dengan produksi, jadi konfigurasi lama tidak berubah sedikit pun.
+
+    Diperlukan supaya jendela uji bisa diperpanjang lewat timeframe besar
+    (2h, 8h, 1day) tanpa mengubah kode produksi.
+    """
+    ordered = sorted(timeframes, key=_timeframe_minutes)
+    count = len(ordered)
+    return {
+        tf: round(3.0 - 0.5 * (count - 1 - index), 2)
+        for index, tf in enumerate(ordered)
+    }
+
+
+
 async def run(args) -> int:
     pairs = [item.strip() for item in args.pairs.split(",") if item.strip()]
     timeframes = [
@@ -553,15 +809,9 @@ async def run(args) -> int:
     # kalau tidak coverage_ratio akan jatuh dan seluruh sinyal ter-veto
     # oleh gate kelengkapan data.
     xa.TIMEFRAMES = list(timeframes)
-    xa.TIMEFRAME_WEIGHTS = {
-        tf: weight
-        for tf, weight in {
-            "5min": 1.0, "15min": 1.5, "30min": 2.0, "1h": 2.5, "4h": 3.0,
-        }.items()
-        if tf in timeframes
-    }
+    xa.TIMEFRAME_WEIGHTS = _timeframe_weights(timeframes)
     xa.HIGHER_TIMEFRAMES = tuple(
-        tf for tf in ("30min", "1h", "4h") if tf in timeframes
+        tf for tf in timeframes if _timeframe_minutes(tf) >= 30
     )
     xa.ENTRY_TIMEFRAME_FOR_ATR = args.atr_tf
 
@@ -573,6 +823,14 @@ async def run(args) -> int:
     print(f"Ambang confidence    : {xa.MIN_CONFIDENCE_FOR_SIGNAL}")
     print(f"Bobot partial        : {xa._normalized_partial_weights()}")
 
+    sweep_values = tuple(
+        float(item) for item in args.sweep_breakeven.split(",") if item.strip()
+    ) if args.sweep_breakeven else ()
+
+    horizons = tuple(
+        int(item) for item in args.horizon_test.split(",") if item.strip()
+    ) if args.horizon_test else ()
+
     spreads = dict(DEFAULT_SPREADS)
     if args.spread_xau is not None:
         spreads["XAU/USD"] = args.spread_xau
@@ -583,15 +841,24 @@ async def run(args) -> int:
             pair=pair,
             exec_timeframe=args.exec_tf,
             timeframes=timeframes,
+            atr_timeframe=args.atr_tf,
             spread=spreads.get(pair, 0.0),
             step=args.step,
             max_steps=args.max_steps,
             breakeven_at_mfe_r=args.breakeven_mfe_r,
             allow_overlap=args.allow_overlap,
+            sweep_values=sweep_values,
+            horizons=horizons,
+            invert=args.invert,
         )
         report(result)
         if "error" not in result and result["trades"]:
             frame = pd.DataFrame(result["trades"])
+            if args.dump_csv:
+                stem = pair.replace("/", "")
+                path = f"{stem}_{args.dump_csv}"
+                frame.to_csv(path, index=False)
+                print(f"\nRincian per-trade disimpan: {path}")
             summary.append((pair, len(frame), frame["net_r"].sum(),
                             frame["net_r"].mean()))
 
@@ -620,6 +887,29 @@ def main() -> int:
     parser.add_argument("--breakeven-mfe-r", type=float, default=0.0,
                         help="Breakeven dini pada n x R (0 = mati).")
     parser.add_argument("--spread-xau", type=float, default=None)
+    parser.add_argument(
+        "--sweep-breakeven",
+        default="",
+        help="Uji beberapa ambang breakeven dini sekaligus, mis. "
+             "'0,0.4,0.5,0.6,0.75,1.0'. Satu kali jalan, entry identik.",
+    )
+    parser.add_argument(
+        "--invert",
+        action="store_true",
+        help="DIAGNOSTIK: ambil sisi berlawanan dari tiap sinyal, "
+             "geometri dicerminkan terhadap entry. Bukan strategi siap pakai.",
+    )
+    parser.add_argument(
+        "--horizon-test",
+        default="",
+        help="Ukur pergerakan harga N candle setelah sinyal, mis. "
+             "'4,12,24,48'. Mengabaikan SL/TP -- menguji arahnya saja.",
+    )
+    parser.add_argument(
+        "--dump-csv",
+        default="",
+        help="Simpan rincian per-trade, mis. --dump-csv trades.csv",
+    )
     parser.add_argument(
         "--allow-overlap",
         action="store_true",
